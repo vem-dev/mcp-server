@@ -15,6 +15,7 @@ import {
 	ConfigService,
 	CURRENT_STATE_FILE,
 	computeSessionStats,
+	CycleService,
 	DECISIONS_DIR,
 	getRepoRoot,
 	getVemDir,
@@ -38,6 +39,7 @@ const server = new Server(
 );
 
 const taskService = new TaskService();
+const cycleService = new CycleService();
 const configService = new ConfigService();
 const syncService = new SyncService();
 const metricsService = new UsageMetricsService();
@@ -679,6 +681,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 					required: ["task_id", "session_id"],
 				},
 			},
+			{
+				name: "get_cycle_context",
+				description:
+					"Get the active cycle's goal and assigned tasks. Gives agents immediate context on what the current focus period is working towards.",
+				inputSchema: {
+					type: "object",
+					properties: {},
+				},
+			},
+			{
+				name: "get_flow_metrics",
+				description:
+					"Get flow metrics: WIP count, throughput, and average cycle/lead times for the project. Optionally get per-task metrics.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						task_id: {
+							type: "string",
+							description:
+								"Optional task ID for per-task metrics. If omitted, returns project-level summary.",
+						},
+					},
+				},
+			},
 		],
 	};
 });
@@ -722,11 +748,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			return { ...t, _last_session_hint: hint };
 		});
 
+		const activeCycle = await cycleService.getActiveCycle();
+		const parts: string[] = [];
+		if (activeCycle) {
+			parts.push(
+				`Current cycle goal: "${activeCycle.goal}" (${activeCycle.name})`,
+			);
+		}
+		parts.push(JSON.stringify(annotated, null, 2));
+
 		return {
 			content: [
 				{
 					type: "text",
-					text: JSON.stringify(annotated, null, 2),
+					text: parts.join("\n\n"),
 				},
 			],
 		};
@@ -1847,6 +1882,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 				{
 					type: "text",
 					text: `Stats saved for session ${sessionId} on task ${taskId}:\n${JSON.stringify(stats, null, 2)}`,
+				},
+			],
+		};
+	}
+
+	if (name === "get_cycle_context") {
+		const activeCycle = await cycleService.getActiveCycle();
+		if (!activeCycle) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "No active cycle. Create and start one with: vem cycle create / vem cycle start",
+					},
+				],
+			};
+		}
+		const allTasks = await taskService.getTasks();
+		const cycleTasks = allTasks.filter(
+			(t: any) => t.cycle_id === activeCycle.id && !t.deleted_at,
+		);
+		const result = {
+			cycle: {
+				id: activeCycle.id,
+				name: activeCycle.name,
+				goal: activeCycle.goal,
+				appetite: activeCycle.appetite,
+				status: activeCycle.status,
+				start_at: activeCycle.start_at,
+			},
+			tasks: cycleTasks.map((t: any) => ({
+				id: t.id,
+				title: t.title,
+				status: t.status,
+				priority: t.priority,
+				impact_score: t.impact_score,
+			})),
+			summary: `Active cycle: "${activeCycle.name}" — Goal: ${activeCycle.goal}. ${cycleTasks.length} task(s) assigned, ${cycleTasks.filter((t: any) => t.status === "done").length} done.`,
+		};
+		return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+	}
+
+	if (name === "get_flow_metrics") {
+		const taskId = args?.task_id as string | undefined;
+		const fmtMs = (ms?: number) =>
+			ms !== undefined ? `${Math.round(ms / 3600000)}h` : "n/a";
+		if (taskId) {
+			const metrics = await taskService.getFlowMetrics(taskId);
+			return {
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify(
+							{
+								task_id: metrics.task_id,
+								lead_time: fmtMs(metrics.lead_time_ms),
+								cycle_time: fmtMs(metrics.cycle_time_ms),
+								time_in_status: Object.fromEntries(
+									Object.entries(metrics.time_in_status).map(([k, v]) => [
+										k,
+										fmtMs(v),
+									]),
+								),
+							},
+							null,
+							2,
+						),
+					},
+				],
+			};
+		}
+		const summary = await taskService.getProjectFlowSummary();
+		return {
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(
+						{
+							wip_count: summary.wip_count,
+							throughput_last_7d: summary.throughput_last_7d,
+							throughput_last_30d: summary.throughput_last_30d,
+							avg_cycle_time: fmtMs(summary.avg_cycle_time_ms),
+							avg_lead_time: fmtMs(summary.avg_lead_time_ms),
+						},
+						null,
+						2,
+					),
 				},
 			],
 		};

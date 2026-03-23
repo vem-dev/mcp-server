@@ -15,6 +15,9 @@ import {
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 
+// ../../packages/core/dist/provider-key-encryption.js
+import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
+
 // ../../packages/core/dist/agent.js
 import path5 from "path";
 
@@ -54,6 +57,7 @@ var TaskActionSchema = z.object({
     "update_recurrence",
     "update_owner",
     "update_reviewer",
+    "update_cycle",
     "delete",
     "comment",
     "completion"
@@ -64,12 +68,61 @@ var TaskActionSchema = z.object({
 });
 var TaskStatusSchema = z.enum([
   "todo",
+  "ready",
+  "in-review",
   "in-progress",
   "blocked",
   "done"
 ]);
 var TaskPrioritySchema = z.enum(["low", "medium", "high", "critical"]);
-var TaskTypeSchema = z.enum(["feature", "bug", "chore"]);
+var TaskTypeSchema = z.enum([
+  "feature",
+  "bug",
+  "chore",
+  "spike",
+  "enabler"
+]);
+var CycleAppetiteSchema = z.enum(["small", "medium", "large"]);
+var CycleStatusSchema = z.enum(["planned", "active", "closed"]);
+var CycleSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  goal: z.string(),
+  appetite: CycleAppetiteSchema.optional(),
+  status: CycleStatusSchema,
+  start_at: z.string().datetime().optional(),
+  closed_at: z.string().datetime().optional(),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime()
+});
+var CycleCreateSchema = z.object({
+  name: z.string(),
+  goal: z.string(),
+  appetite: CycleAppetiteSchema.optional(),
+  start_at: z.string().datetime().optional()
+});
+var CycleUpdateSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  goal: z.string().optional(),
+  appetite: CycleAppetiteSchema.optional(),
+  status: CycleStatusSchema.optional(),
+  start_at: z.string().datetime().optional(),
+  closed_at: z.string().datetime().optional()
+});
+var TaskFlowMetricsSchema = z.object({
+  task_id: z.string(),
+  lead_time_ms: z.number().int().optional(),
+  cycle_time_ms: z.number().int().optional(),
+  time_in_status: z.record(z.string(), z.number().int())
+});
+var ProjectFlowSummarySchema = z.object({
+  wip_count: z.number().int(),
+  throughput_last_7d: z.number().int(),
+  throughput_last_30d: z.number().int(),
+  avg_cycle_time_ms: z.number().int().optional(),
+  avg_lead_time_ms: z.number().int().optional()
+});
 var TaskSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -99,7 +152,12 @@ var TaskSchema = z.object({
   updated_at: z.string().datetime().optional(),
   due_at: z.string().datetime().optional(),
   github_issue_number: z.number().optional(),
-  deleted_at: z.string().datetime().optional()
+  deleted_at: z.string().datetime().optional(),
+  // Context-Flow fields
+  cycle_id: z.string().optional(),
+  impact_score: z.number().min(0).max(100).optional(),
+  ready_at: z.string().datetime().optional(),
+  started_at: z.string().datetime().optional()
 });
 var TaskListSchema = z.object({
   tasks: z.array(TaskSchema)
@@ -131,7 +189,10 @@ var TaskUpdateSchema = z.object({
   reasoning: z.string().optional(),
   actor: z.string().optional(),
   github_issue_number: z.number().optional(),
-  deleted_at: z.string().datetime().optional()
+  deleted_at: z.string().datetime().optional(),
+  // Context-Flow fields
+  cycle_id: z.string().optional(),
+  impact_score: z.number().min(0).max(100).optional()
 });
 var TaskCreateSchema = z.object({
   title: z.string(),
@@ -155,7 +216,10 @@ var TaskCreateSchema = z.object({
   task_context_summary: z.string().optional(),
   related_decisions: z.array(RelatedDecisionRefSchema).optional(),
   validation_steps: z.array(z.string()).optional(),
-  reasoning: z.string().optional()
+  reasoning: z.string().optional(),
+  // Context-Flow fields
+  cycle_id: z.string().optional(),
+  impact_score: z.number().min(0).max(100).optional()
 });
 var VemUpdateSchema = z.object({
   tasks: z.array(TaskUpdateSchema).optional(),
@@ -163,7 +227,8 @@ var VemUpdateSchema = z.object({
   changelog_append: z.union([z.string(), z.array(z.string())]).optional(),
   decisions_append: z.union([z.string(), z.array(z.string())]).optional(),
   current_state: z.string().optional(),
-  context: z.string().optional()
+  context: z.string().optional(),
+  new_cycles: z.array(CycleCreateSchema).optional()
 });
 var WebhookEventSchema = z.enum([
   "task.created",
@@ -177,7 +242,10 @@ var WebhookEventSchema = z.enum([
   "decision.added",
   "changelog.updated",
   "drift.detected",
-  "project.linked"
+  "project.linked",
+  "cycle.created",
+  "cycle.started",
+  "cycle.closed"
 ]);
 var WebhookSchema = z.object({
   id: z.string().uuid(),
@@ -221,6 +289,7 @@ import { findUp } from "find-up-simple";
 import fs from "fs-extra";
 var VEM_DIR = ".vem";
 var TASKS_DIR = "tasks";
+var CYCLES_DIR = "cycles";
 var DECISIONS_DIR = "decisions";
 var CHANGELOG_DIR = "changelog";
 var CONTEXT_FILE = "CONTEXT.md";
@@ -667,6 +736,10 @@ var TaskService = class {
       task_context_summary: options?.task_context_summary,
       evidence: options?.evidence,
       validation_steps: options?.validation_steps,
+      cycle_id: options?.cycle_id,
+      impact_score: options?.impact_score,
+      ready_at: initialStatus === "ready" || initialStatus === "in-progress" ? timestamp : void 0,
+      started_at: initialStatus === "in-progress" ? timestamp : void 0,
       created_at: timestamp,
       updated_at: timestamp,
       actions: [
@@ -734,6 +807,10 @@ var TaskService = class {
     const nextTaskContext = taskContextProvided ? normalizeText(taskPatch.task_context) : currentTask.task_context;
     let nextTaskContextSummary = taskContextSummaryProvided ? normalizeText(taskPatch.task_context_summary) : currentTask.task_context_summary;
     const nextValidationSteps = validationProvided ? normalizeStringArray(taskPatch.validation_steps) ?? [] : currentTask.validation_steps;
+    const cycleIdProvided = hasOwn("cycle_id");
+    const nextCycleId = cycleIdProvided ? taskPatch.cycle_id : currentTask.cycle_id;
+    const impactScoreProvided = hasOwn("impact_score");
+    const nextImpactScore = impactScoreProvided ? taskPatch.impact_score : currentTask.impact_score;
     const blockingIds = await this.getBlockingIds(nextDependsOn, nextBlockedBy, storage);
     const hasBlocking = blockingIds.length > 0;
     if (nextStatus === "done" && hasBlocking) {
@@ -851,6 +928,14 @@ var TaskService = class {
         created_at: timestamp
       });
     }
+    if (cycleIdProvided && nextCycleId !== currentTask.cycle_id) {
+      actions.push({
+        type: "update_cycle",
+        reasoning: taskPatch.reasoning ?? null,
+        actor: actorValue ?? null,
+        created_at: timestamp
+      });
+    }
     if (deletedProvided && taskPatch.deleted_at !== currentTask.deleted_at) {
       actions.push({
         type: "delete",
@@ -860,6 +945,8 @@ var TaskService = class {
       });
     }
     let finalTaskContext = nextTaskContext;
+    const nextReadyAt = effectiveStatus === "ready" && !currentTask.ready_at ? timestamp : taskPatch.ready_at ?? currentTask.ready_at;
+    const nextStartedAt = effectiveStatus === "in-progress" && !currentTask.started_at ? timestamp : taskPatch.started_at ?? currentTask.started_at;
     if (effectiveStatus === "done" && finalTaskContext) {
       if (!nextTaskContextSummary) {
         nextTaskContextSummary = summarizeTaskContext(finalTaskContext);
@@ -882,6 +969,10 @@ var TaskService = class {
       task_context: finalTaskContext,
       task_context_summary: nextTaskContextSummary,
       validation_steps: nextValidationSteps,
+      cycle_id: nextCycleId,
+      impact_score: nextImpactScore,
+      ready_at: nextReadyAt,
+      started_at: nextStartedAt,
       actions,
       updated_at: timestamp
     };
@@ -981,6 +1072,80 @@ var TaskService = class {
       }
     }
     return count;
+  }
+  async getFlowMetrics(taskId) {
+    const task = await this.getTask(taskId);
+    if (!task)
+      throw new Error(`Task ${taskId} not found`);
+    const actions = task.actions ?? [];
+    const completionAction = actions.find((a) => a.type === "completion");
+    const createdAtMs = task.created_at ? new Date(task.created_at).getTime() : void 0;
+    const completionMs = completionAction ? new Date(completionAction.created_at).getTime() : void 0;
+    const startedAtMs = task.started_at ? new Date(task.started_at).getTime() : void 0;
+    const readyAtMs = task.ready_at ? new Date(task.ready_at).getTime() : void 0;
+    const lead_time_ms = createdAtMs !== void 0 && completionMs !== void 0 ? completionMs - createdAtMs : void 0;
+    const cycle_time_ms = startedAtMs !== void 0 && completionMs !== void 0 ? completionMs - startedAtMs : void 0;
+    const time_in_status = {};
+    if (createdAtMs !== void 0) {
+      if (readyAtMs !== void 0) {
+        time_in_status["todo"] = readyAtMs - createdAtMs;
+        if (startedAtMs !== void 0) {
+          time_in_status["ready"] = startedAtMs - readyAtMs;
+        }
+      } else if (startedAtMs !== void 0) {
+        time_in_status["todo"] = startedAtMs - createdAtMs;
+      }
+    }
+    if (startedAtMs !== void 0) {
+      if (completionMs !== void 0) {
+        time_in_status["in-progress"] = completionMs - startedAtMs;
+      } else if (task.status === "in-progress") {
+        time_in_status["in-progress"] = Date.now() - startedAtMs;
+      }
+    }
+    return {
+      task_id: taskId,
+      lead_time_ms,
+      cycle_time_ms,
+      time_in_status
+    };
+  }
+  async getProjectFlowSummary() {
+    const tasks = await this.getTasks();
+    const now = Date.now();
+    const ms7d = 7 * 24 * 60 * 60 * 1e3;
+    const ms30d = 30 * 24 * 60 * 60 * 1e3;
+    const wip_count = tasks.filter((t) => t.status === "in-progress").length;
+    const doneTasks = tasks.filter((t) => t.status === "done");
+    const throughput_last_7d = doneTasks.filter((t) => {
+      const updatedAt = t.updated_at ? new Date(t.updated_at).getTime() : 0;
+      return now - updatedAt <= ms7d;
+    }).length;
+    const throughput_last_30d = doneTasks.filter((t) => {
+      const updatedAt = t.updated_at ? new Date(t.updated_at).getTime() : 0;
+      return now - updatedAt <= ms30d;
+    }).length;
+    const cycleTimes = doneTasks.map((t) => {
+      const completionAction = (t.actions ?? []).find((a) => a.type === "completion");
+      if (!t.started_at || !completionAction)
+        return null;
+      return new Date(completionAction.created_at).getTime() - new Date(t.started_at).getTime();
+    }).filter((v) => v !== null);
+    const avg_cycle_time_ms = cycleTimes.length > 0 ? Math.round(cycleTimes.reduce((a, b) => a + b, 0) / cycleTimes.length) : void 0;
+    const leadTimes = doneTasks.map((t) => {
+      const completionAction = (t.actions ?? []).find((a) => a.type === "completion");
+      if (!t.created_at || !completionAction)
+        return null;
+      return new Date(completionAction.created_at).getTime() - new Date(t.created_at).getTime();
+    }).filter((v) => v !== null);
+    const avg_lead_time_ms = leadTimes.length > 0 ? Math.round(leadTimes.reduce((a, b) => a + b, 0) / leadTimes.length) : void 0;
+    return {
+      wip_count,
+      throughput_last_7d,
+      throughput_last_30d,
+      avg_cycle_time_ms,
+      avg_lead_time_ms
+    };
   }
 };
 
@@ -1684,12 +1849,12 @@ var SyncService = class {
       includeCommitHashes: true
     });
     const secretMatches = [];
-    const addSecretMatch = (path10, value) => {
+    const addSecretMatch = (path11, value) => {
       if (!value)
         return;
       const types = detectSecrets(value);
       if (types.length > 0) {
-        secretMatches.push({ path: path10, types });
+        secretMatches.push({ path: path11, types });
       }
     };
     const contextPath = await this.getContextPath();
@@ -1885,9 +2050,104 @@ ${body}`;
   }
 };
 
+// ../../packages/core/dist/cycles.js
+import path10 from "path";
+import fs10 from "fs-extra";
+var CycleService = class {
+  async getCyclesDir() {
+    const vemDir = await getVemDir();
+    const dir = path10.join(vemDir, CYCLES_DIR);
+    await fs10.ensureDir(dir);
+    return dir;
+  }
+  cycleFilePath(dir, id) {
+    return path10.join(dir, `${id}.json`);
+  }
+  async getNextCycleId(dir) {
+    let maxNum = 0;
+    const entries = await fs10.readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      const match = entry.match(/^CYCLE-(\d{3,})\.json$/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (!Number.isNaN(num) && num > maxNum) {
+          maxNum = num;
+        }
+      }
+    }
+    return `CYCLE-${String(maxNum + 1).padStart(3, "0")}`;
+  }
+  async createCycle(input) {
+    const dir = await this.getCyclesDir();
+    const id = await this.getNextCycleId(dir);
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const cycle = {
+      id,
+      name: input.name,
+      goal: input.goal,
+      appetite: input.appetite,
+      status: "planned",
+      start_at: input.start_at,
+      created_at: timestamp,
+      updated_at: timestamp
+    };
+    await fs10.writeJson(this.cycleFilePath(dir, id), cycle, { spaces: 2 });
+    return cycle;
+  }
+  async getCycles() {
+    const dir = await this.getCyclesDir();
+    const entries = await fs10.readdir(dir).catch(() => []);
+    const cycles = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".json"))
+        continue;
+      try {
+        const cycle = await fs10.readJson(path10.join(dir, entry));
+        if (cycle?.id)
+          cycles.push(cycle);
+      } catch {
+      }
+    }
+    return cycles.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+  async getCycle(id) {
+    const dir = await this.getCyclesDir();
+    const filePath = this.cycleFilePath(dir, id);
+    if (!await fs10.pathExists(filePath))
+      return null;
+    try {
+      return await fs10.readJson(filePath);
+    } catch {
+      return null;
+    }
+  }
+  async updateCycle(id, patch) {
+    const dir = await this.getCyclesDir();
+    const filePath = this.cycleFilePath(dir, id);
+    const current = await this.getCycle(id);
+    if (!current) {
+      throw new Error(`Cycle ${id} not found`);
+    }
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const updated = { ...current, ...patch, id, updated_at: timestamp };
+    if (patch.status === "active" && current.status !== "active") {
+      updated.start_at = updated.start_at ?? timestamp;
+    }
+    if (patch.status === "closed" && current.status !== "closed") {
+      updated.closed_at = updated.closed_at ?? timestamp;
+    }
+    await fs10.writeJson(filePath, updated, { spaces: 2 });
+    return updated;
+  }
+  async getActiveCycle() {
+    const cycles = await this.getCycles();
+    return cycles.find((c) => c.status === "active") ?? null;
+  }
+};
+
 // ../../packages/core/dist/usage-metrics.js
 import { join } from "path";
-import fs10 from "fs-extra";
+import fs11 from "fs-extra";
 var UsageMetricsService = class _UsageMetricsService {
   metricsPath = null;
   baseDir;
@@ -2087,8 +2347,8 @@ var UsageMetricsService = class _UsageMetricsService {
   async loadMetrics() {
     try {
       const metricsPath = await this.getMetricsPath();
-      if (await fs10.pathExists(metricsPath)) {
-        const content = await fs10.readFile(metricsPath, "utf-8");
+      if (await fs11.pathExists(metricsPath)) {
+        const content = await fs11.readFile(metricsPath, "utf-8");
         return JSON.parse(content);
       }
     } catch (_error) {
@@ -2107,7 +2367,7 @@ var UsageMetricsService = class _UsageMetricsService {
    */
   async saveMetrics(data) {
     const metricsPath = await this.getMetricsPath();
-    await fs10.writeFile(metricsPath, JSON.stringify(data, null, 2), "utf-8");
+    await fs11.writeFile(metricsPath, JSON.stringify(data, null, 2), "utf-8");
   }
   isCloudSyncEnabled() {
     const disabled = (process.env.VEM_DISABLE_METRICS || "").toLowerCase();
@@ -2139,6 +2399,7 @@ var server = new Server(
   }
 );
 var taskService = new TaskService();
+var cycleService = new CycleService();
 var configService = new ConfigService();
 var syncService = new SyncService();
 var metricsService = new UsageMetricsService();
@@ -2707,6 +2968,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["task_id", "session_id"]
         }
+      },
+      {
+        name: "get_cycle_context",
+        description: "Get the active cycle's goal and assigned tasks. Gives agents immediate context on what the current focus period is working towards.",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "get_flow_metrics",
+        description: "Get flow metrics: WIP count, throughput, and average cycle/lead times for the project. Optionally get per-task metrics.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            task_id: {
+              type: "string",
+              description: "Optional task ID for per-task metrics. If omitted, returns project-level summary."
+            }
+          }
+        }
       }
     ]
   };
@@ -2736,11 +3018,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const hint = last.summary ? `Last worked by ${last.source} on ${last.started_at.slice(0, 10)}: ${last.summary}` : `Last worked by ${last.source} on ${last.started_at.slice(0, 10)}`;
       return { ...t, _last_session_hint: hint };
     });
+    const activeCycle = await cycleService.getActiveCycle();
+    const parts = [];
+    if (activeCycle) {
+      parts.push(
+        `Current cycle goal: "${activeCycle.goal}" (${activeCycle.name})`
+      );
+    }
+    parts.push(JSON.stringify(annotated, null, 2));
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(annotated, null, 2)
+          text: parts.join("\n\n")
         }
       ]
     };
@@ -2935,7 +3225,7 @@ ${JSON.stringify(updated, null, 2)}`
   }
   if (name === "ask_question") {
     const question = args?.question;
-    const path10 = args?.path;
+    const path11 = args?.path;
     const apiKey = await configService.getApiKey();
     const projectId = await configService.getProjectId();
     if (!apiKey) {
@@ -2964,7 +3254,7 @@ ${JSON.stringify(updated, null, 2)}`
       const { deviceId, deviceName } = await configService.getOrCreateDeviceId();
       const apiUrl = process.env.VEM_API_URL || "http://localhost:3002";
       const payload = { question };
-      if (path10) payload.path = path10;
+      if (path11) payload.path = path11;
       const res = await fetch(`${apiUrl}/projects/${projectId}/ask`, {
         method: "POST",
         headers: {
@@ -3735,6 +4025,90 @@ No changes pushed. Remove dry_run to push for real.`
           type: "text",
           text: `Stats saved for session ${sessionId} on task ${taskId2}:
 ${JSON.stringify(stats, null, 2)}`
+        }
+      ]
+    };
+  }
+  if (name === "get_cycle_context") {
+    const activeCycle = await cycleService.getActiveCycle();
+    if (!activeCycle) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No active cycle. Create and start one with: vem cycle create / vem cycle start"
+          }
+        ]
+      };
+    }
+    const allTasks = await taskService.getTasks();
+    const cycleTasks = allTasks.filter(
+      (t) => t.cycle_id === activeCycle.id && !t.deleted_at
+    );
+    const result = {
+      cycle: {
+        id: activeCycle.id,
+        name: activeCycle.name,
+        goal: activeCycle.goal,
+        appetite: activeCycle.appetite,
+        status: activeCycle.status,
+        start_at: activeCycle.start_at
+      },
+      tasks: cycleTasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+        impact_score: t.impact_score
+      })),
+      summary: `Active cycle: "${activeCycle.name}" \u2014 Goal: ${activeCycle.goal}. ${cycleTasks.length} task(s) assigned, ${cycleTasks.filter((t) => t.status === "done").length} done.`
+    };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+  if (name === "get_flow_metrics") {
+    const taskId2 = args?.task_id;
+    const fmtMs = (ms) => ms !== void 0 ? `${Math.round(ms / 36e5)}h` : "n/a";
+    if (taskId2) {
+      const metrics = await taskService.getFlowMetrics(taskId2);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                task_id: metrics.task_id,
+                lead_time: fmtMs(metrics.lead_time_ms),
+                cycle_time: fmtMs(metrics.cycle_time_ms),
+                time_in_status: Object.fromEntries(
+                  Object.entries(metrics.time_in_status).map(([k, v]) => [
+                    k,
+                    fmtMs(v)
+                  ])
+                )
+              },
+              null,
+              2
+            )
+          }
+        ]
+      };
+    }
+    const summary = await taskService.getProjectFlowSummary();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              wip_count: summary.wip_count,
+              throughput_last_7d: summary.throughput_last_7d,
+              throughput_last_30d: summary.throughput_last_30d,
+              avg_cycle_time: fmtMs(summary.avg_cycle_time_ms),
+              avg_lead_time: fmtMs(summary.avg_lead_time_ms)
+            },
+            null,
+            2
+          )
         }
       ]
     };
