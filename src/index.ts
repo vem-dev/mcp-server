@@ -1020,6 +1020,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 			const payload: any = { question };
 			if (path) payload.path = path;
+			if (process.env.VEM_TASK_RUN_ID) payload.taskRunId = process.env.VEM_TASK_RUN_ID;
 
 			const res = await fetch(`${apiUrl}/projects/${projectId}/ask`, {
 				method: "POST",

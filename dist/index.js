@@ -19,7 +19,7 @@ import {
 import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
 
 // ../../packages/core/dist/agent.js
-import path5 from "path";
+import path6 from "path";
 
 // ../../packages/schemas/dist/index.js
 import { z } from "zod";
@@ -236,6 +236,7 @@ var WebhookEventSchema = z.enum([
   "task.blocked",
   "task.completed",
   "task.deleted",
+  "task.updated",
   "snapshot.pushed",
   "snapshot.verified",
   "snapshot.failed",
@@ -243,9 +244,17 @@ var WebhookEventSchema = z.enum([
   "changelog.updated",
   "drift.detected",
   "project.linked",
+  "project.created",
+  "project.deleted",
   "cycle.created",
   "cycle.started",
-  "cycle.closed"
+  "cycle.closed",
+  "task_run.started",
+  "task_run.completed",
+  "task_run.failed",
+  "task_run.cancelled",
+  "member.invited",
+  "member.joined"
 ]);
 var WebhookSchema = z.object({
   id: z.string().uuid(),
@@ -281,7 +290,7 @@ var WebhookDeliverySchema = z.object({
 });
 
 // ../../packages/core/dist/agent.js
-import fs5 from "fs-extra";
+import fs6 from "fs-extra";
 
 // ../../packages/core/dist/fs.js
 import path from "path";
@@ -464,14 +473,109 @@ ${entry.content}`;
   }
 };
 
+// ../../packages/core/dist/cycles.js
+import path3 from "path";
+import fs3 from "fs-extra";
+var CycleService = class {
+  async getCyclesDir() {
+    const vemDir = await getVemDir();
+    const dir = path3.join(vemDir, CYCLES_DIR);
+    await fs3.ensureDir(dir);
+    return dir;
+  }
+  cycleFilePath(dir, id) {
+    return path3.join(dir, `${id}.json`);
+  }
+  async getNextCycleId(dir) {
+    let maxNum = 0;
+    const entries = await fs3.readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      const match = entry.match(/^CYCLE-(\d{3,})\.json$/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (!Number.isNaN(num) && num > maxNum) {
+          maxNum = num;
+        }
+      }
+    }
+    return `CYCLE-${String(maxNum + 1).padStart(3, "0")}`;
+  }
+  async createCycle(input) {
+    const dir = await this.getCyclesDir();
+    const id = await this.getNextCycleId(dir);
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const cycle = {
+      id,
+      name: input.name,
+      goal: input.goal,
+      appetite: input.appetite,
+      status: "planned",
+      start_at: input.start_at,
+      created_at: timestamp,
+      updated_at: timestamp
+    };
+    await fs3.writeJson(this.cycleFilePath(dir, id), cycle, { spaces: 2 });
+    return cycle;
+  }
+  async getCycles() {
+    const dir = await this.getCyclesDir();
+    const entries = await fs3.readdir(dir).catch(() => []);
+    const cycles = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".json"))
+        continue;
+      try {
+        const cycle = await fs3.readJson(path3.join(dir, entry));
+        if (cycle?.id)
+          cycles.push(cycle);
+      } catch {
+      }
+    }
+    return cycles.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+  async getCycle(id) {
+    const dir = await this.getCyclesDir();
+    const filePath = this.cycleFilePath(dir, id);
+    if (!await fs3.pathExists(filePath))
+      return null;
+    try {
+      return await fs3.readJson(filePath);
+    } catch {
+      return null;
+    }
+  }
+  async updateCycle(id, patch) {
+    const dir = await this.getCyclesDir();
+    const filePath = this.cycleFilePath(dir, id);
+    const current = await this.getCycle(id);
+    if (!current) {
+      throw new Error(`Cycle ${id} not found`);
+    }
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const updated = { ...current, ...patch, id, updated_at: timestamp };
+    if (patch.status === "active" && current.status !== "active") {
+      updated.start_at = updated.start_at ?? timestamp;
+    }
+    if (patch.status === "closed" && current.status !== "closed") {
+      updated.closed_at = updated.closed_at ?? timestamp;
+    }
+    await fs3.writeJson(filePath, updated, { spaces: 2 });
+    return updated;
+  }
+  async getActiveCycle() {
+    const cycles = await this.getCycles();
+    return cycles.find((c) => c.status === "active") ?? null;
+  }
+};
+
 // ../../packages/core/dist/tasks.js
-import path4 from "path";
-import fs4 from "fs-extra";
+import path5 from "path";
+import fs5 from "fs-extra";
 
 // ../../packages/core/dist/sharded-fs.js
 import crypto from "crypto";
-import path3 from "path";
-import fs3 from "fs-extra";
+import path4 from "path";
+import fs4 from "fs-extra";
 var ShardedFileStorage = class {
   baseDir;
   objectsDirName;
@@ -480,7 +584,7 @@ var ShardedFileStorage = class {
     this.objectsDirName = objectsDirName;
   }
   getObjectsDir() {
-    return path3.join(this.baseDir, this.objectsDirName);
+    return path4.join(this.baseDir, this.objectsDirName);
   }
   getShard(id) {
     const hash = crypto.createHash("sha1").update(id).digest("hex");
@@ -488,42 +592,42 @@ var ShardedFileStorage = class {
   }
   getFilePath(id) {
     const shard = this.getShard(id);
-    return path3.join(this.getObjectsDir(), shard, `${id}.json`);
+    return path4.join(this.getObjectsDir(), shard, `${id}.json`);
   }
   async save(record) {
     const filePath = this.getFilePath(record.id);
-    await fs3.ensureDir(path3.dirname(filePath));
-    await fs3.writeJson(filePath, record, { spaces: 2 });
+    await fs4.ensureDir(path4.dirname(filePath));
+    await fs4.writeJson(filePath, record, { spaces: 2 });
   }
   async load(id) {
     const filePath = this.getFilePath(id);
-    if (!await fs3.pathExists(filePath)) {
+    if (!await fs4.pathExists(filePath)) {
       return null;
     }
-    return fs3.readJson(filePath);
+    return fs4.readJson(filePath);
   }
   async delete(id) {
     const filePath = this.getFilePath(id);
-    if (await fs3.pathExists(filePath)) {
-      await fs3.remove(filePath);
+    if (await fs4.pathExists(filePath)) {
+      await fs4.remove(filePath);
     }
   }
   async listIds() {
     const objectsDir = this.getObjectsDir();
-    if (!await fs3.pathExists(objectsDir)) {
+    if (!await fs4.pathExists(objectsDir)) {
       return [];
     }
-    const shards = await fs3.readdir(objectsDir);
+    const shards = await fs4.readdir(objectsDir);
     const ids = [];
     for (const shard of shards) {
-      const shardPath = path3.join(objectsDir, shard);
-      const stat = await fs3.stat(shardPath);
+      const shardPath = path4.join(objectsDir, shard);
+      const stat = await fs4.stat(shardPath);
       if (!stat.isDirectory())
         continue;
-      const files = await fs3.readdir(shardPath);
+      const files = await fs4.readdir(shardPath);
       for (const file of files) {
         if (file.endsWith(".json")) {
-          ids.push(path3.parse(file).name);
+          ids.push(path4.parse(file).name);
         }
       }
     }
@@ -544,22 +648,22 @@ var ShardedFileStorage = class {
 var TaskIndex = class {
   indexPath;
   constructor(baseDir) {
-    this.indexPath = path3.join(baseDir, "index.json");
+    this.indexPath = path4.join(baseDir, "index.json");
   }
   async load() {
-    if (!await fs3.pathExists(this.indexPath)) {
+    if (!await fs4.pathExists(this.indexPath)) {
       return [];
     }
     try {
-      const data = await fs3.readJson(this.indexPath);
+      const data = await fs4.readJson(this.indexPath);
       return data.entries || [];
     } catch {
       return [];
     }
   }
   async save(entries) {
-    await fs3.ensureDir(path3.dirname(this.indexPath));
-    await fs3.writeJson(this.indexPath, { entries }, { spaces: 2 });
+    await fs4.ensureDir(path4.dirname(this.indexPath));
+    await fs4.writeJson(this.indexPath, { entries }, { spaces: 2 });
   }
   async updateEntry(entry) {
     const entries = await this.load();
@@ -596,8 +700,8 @@ var TaskService = class {
       return { storage: this.storage, index: this.index };
     }
     const vemDir = await getVemDir();
-    const baseDir = path4.join(vemDir, TASKS_DIR);
-    await fs4.ensureDir(baseDir);
+    const baseDir = path5.join(vemDir, TASKS_DIR);
+    await fs5.ensureDir(baseDir);
     this.storage = new ShardedFileStorage(baseDir);
     this.index = new TaskIndex(baseDir);
     return { storage: this.storage, index: this.index };
@@ -615,16 +719,16 @@ var TaskService = class {
   }
   async loadRecentArchivedTasks(withinDays) {
     const vemDir = await getVemDir();
-    const archiveDir = path4.join(vemDir, TASKS_DIR, "archive");
-    if (!await fs4.pathExists(archiveDir))
+    const archiveDir = path5.join(vemDir, TASKS_DIR, "archive");
+    if (!await fs5.pathExists(archiveDir))
       return [];
     const cutoff = Date.now() - withinDays * 24 * 60 * 60 * 1e3;
     const result = [];
     const walk = async (dir) => {
-      const entries = await fs4.readdir(dir);
+      const entries = await fs5.readdir(dir);
       for (const entry of entries) {
-        const fullPath = path4.join(dir, entry);
-        const stat = await fs4.stat(fullPath);
+        const fullPath = path5.join(dir, entry);
+        const stat = await fs5.stat(fullPath);
         if (stat.isDirectory()) {
           await walk(fullPath);
           continue;
@@ -634,7 +738,7 @@ var TaskService = class {
         if (stat.mtimeMs < cutoff)
           continue;
         try {
-          const task = await fs4.readJson(fullPath);
+          const task = await fs5.readJson(fullPath);
           if (task?.id)
             result.push(task);
         } catch {
@@ -654,23 +758,23 @@ var TaskService = class {
   }
   async listArchivedTaskIds() {
     const vemDir = await getVemDir();
-    const archiveDir = path4.join(vemDir, TASKS_DIR, "archive");
-    if (!await fs4.pathExists(archiveDir)) {
+    const archiveDir = path5.join(vemDir, TASKS_DIR, "archive");
+    if (!await fs5.pathExists(archiveDir)) {
       return [];
     }
     const ids = [];
     const walk = async (dir) => {
-      const entries = await fs4.readdir(dir);
+      const entries = await fs5.readdir(dir);
       for (const entry of entries) {
-        const fullPath = path4.join(dir, entry);
-        const stat = await fs4.stat(fullPath);
+        const fullPath = path5.join(dir, entry);
+        const stat = await fs5.stat(fullPath);
         if (stat.isDirectory()) {
           await walk(fullPath);
           continue;
         }
         if (!entry.endsWith(".json"))
           continue;
-        const id = path4.parse(entry).name;
+        const id = path5.parse(entry).name;
         if (/^TASK-\d{3,}$/.test(id)) {
           ids.push(id);
         }
@@ -1053,19 +1157,19 @@ var TaskService = class {
     if (candidates.length === 0)
       return 0;
     const vemDir = await getVemDir();
-    const baseDir = path4.join(vemDir, TASKS_DIR);
-    const archiveBase = path4.join(baseDir, "archive");
-    await fs4.ensureDir(archiveBase);
+    const baseDir = path5.join(vemDir, TASKS_DIR);
+    const archiveBase = path5.join(baseDir, "archive");
+    await fs5.ensureDir(archiveBase);
     let count = 0;
     for (const entry of candidates) {
       const task = await storage.load(entry.id);
       if (task) {
         const date = new Date(task.created_at || /* @__PURE__ */ new Date());
         const folder = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-        const targetDir = path4.join(archiveBase, folder);
-        await fs4.ensureDir(targetDir);
-        const destWithId = path4.join(targetDir, `${task.id}.json`);
-        await fs4.writeJson(destWithId, task, { spaces: 2 });
+        const targetDir = path5.join(archiveBase, folder);
+        await fs5.ensureDir(targetDir);
+        const destWithId = path5.join(targetDir, `${task.id}.json`);
+        await fs5.writeJson(destWithId, task, { spaces: 2 });
         await storage.delete(entry.id);
         await index.removeEntry(entry.id);
         count++;
@@ -1302,9 +1406,18 @@ async function applyVemUpdate(update) {
   }
   const currentStateUpdated = await writeCurrentState(update.current_state);
   const contextUpdated = await writeContext(update.context);
+  const newCycles = [];
+  if (update.new_cycles?.length) {
+    const cycleService2 = new CycleService();
+    for (const entry of update.new_cycles) {
+      const created = await cycleService2.createCycle(entry);
+      newCycles.push(created);
+    }
+  }
   return {
     updatedTasks,
     newTasks,
+    newCycles,
     changelogLines,
     decisionsAppended,
     decisionsAppendedRef,
@@ -1352,20 +1465,20 @@ async function writeCurrentState(value) {
   if (value === void 0)
     return false;
   const dir = await getVemDir();
-  const currentStatePath = path5.join(dir, CURRENT_STATE_FILE);
+  const currentStatePath = path6.join(dir, CURRENT_STATE_FILE);
   const next = value.trim().length > 0 ? `${value.trim()}
 ` : "";
-  await fs5.writeFile(currentStatePath, next, "utf-8");
+  await fs6.writeFile(currentStatePath, next, "utf-8");
   return true;
 }
 async function writeContext(value) {
   if (value === void 0)
     return false;
   const dir = await getVemDir();
-  const contextPath = path5.join(dir, CONTEXT_FILE);
+  const contextPath = path6.join(dir, CONTEXT_FILE);
   const next = value.trim().length > 0 ? `${value.trim()}
 ` : "";
-  await fs5.writeFile(contextPath, next, "utf-8");
+  await fs6.writeFile(contextPath, next, "utf-8");
   return true;
 }
 
@@ -1425,23 +1538,23 @@ async function computeSessionStats(sessionId, source) {
 // ../../packages/core/dist/config.js
 import { randomUUID } from "crypto";
 import { homedir, hostname } from "os";
-import path6 from "path";
-import fs6 from "fs-extra";
+import path7 from "path";
+import fs7 from "fs-extra";
 var CONFIG_FILE = "config.json";
 var ConfigService = class {
   async getLocalPath() {
     const dir = await getVemDir();
-    return path6.join(dir, CONFIG_FILE);
+    return path7.join(dir, CONFIG_FILE);
   }
   getGlobalPath() {
-    return path6.join(homedir(), ".vem", CONFIG_FILE);
+    return path7.join(homedir(), ".vem", CONFIG_FILE);
   }
   async readLocalConfig() {
     try {
       const filePath = await this.getLocalPath();
-      if (!await fs6.pathExists(filePath))
+      if (!await fs7.pathExists(filePath))
         return {};
-      return fs6.readJson(filePath);
+      return fs7.readJson(filePath);
     } catch {
       return {};
     }
@@ -1449,9 +1562,9 @@ var ConfigService = class {
   async readGlobalConfig() {
     try {
       const filePath = this.getGlobalPath();
-      if (!await fs6.pathExists(filePath))
+      if (!await fs7.pathExists(filePath))
         return {};
-      return fs6.readJson(filePath);
+      return fs7.readJson(filePath);
     } catch {
       return {};
     }
@@ -1470,7 +1583,7 @@ var ConfigService = class {
       last_push_vem_hash: next.last_push_vem_hash,
       last_synced_vem_hash: next.last_synced_vem_hash
     };
-    await fs6.outputJson(filePath, clean, { spaces: 2 });
+    await fs7.outputJson(filePath, clean, { spaces: 2 });
   }
   async writeGlobalConfig(update) {
     const filePath = this.getGlobalPath();
@@ -1481,7 +1594,7 @@ var ConfigService = class {
       device_id: next.device_id,
       device_name: next.device_name
     };
-    await fs6.outputJson(filePath, clean, { spaces: 2 });
+    await fs7.outputJson(filePath, clean, { spaces: 2 });
   }
   // --- Global Scoped ---
   async getApiKey() {
@@ -1576,23 +1689,23 @@ var ConfigService = class {
   async getContextPath() {
     try {
       const dir = await getVemDir();
-      return path6.join(dir, CONTEXT_FILE);
+      return path7.join(dir, CONTEXT_FILE);
     } catch {
       return "";
     }
   }
   async getContext() {
     const filePath = await this.getContextPath();
-    if (!filePath || !await fs6.pathExists(filePath)) {
+    if (!filePath || !await fs7.pathExists(filePath)) {
       return "";
     }
-    return fs6.readFile(filePath, "utf-8");
+    return fs7.readFile(filePath, "utf-8");
   }
   async updateContext(content) {
     const filePath = await this.getContextPath();
     if (!filePath)
       throw new Error("Cannot update context: Not in a git repository.");
-    await fs6.writeFile(filePath, content, "utf-8");
+    await fs7.writeFile(filePath, content, "utf-8");
   }
   async recordDecision(title, context, decision, relatedTasks) {
     const decisionsLog = new ScalableLogService(DECISIONS_DIR);
@@ -1611,12 +1724,12 @@ ${entry}`;
 
 // ../../packages/core/dist/diff.js
 import { createHash } from "crypto";
-import path7 from "path";
-import fs7 from "fs-extra";
-
-// ../../packages/core/dist/doctor.js
 import path8 from "path";
 import fs8 from "fs-extra";
+
+// ../../packages/core/dist/doctor.js
+import path9 from "path";
+import fs9 from "fs-extra";
 
 // ../../packages/core/dist/env.js
 import { z as z2 } from "zod";
@@ -1732,8 +1845,8 @@ function detectSecrets(input) {
 
 // ../../packages/core/dist/sync.js
 import { createHash as createHash3 } from "crypto";
-import path9 from "path";
-import fs9 from "fs-extra";
+import path10 from "path";
+import fs10 from "fs-extra";
 var KNOWN_AGENT_INSTRUCTION_FILES = [
   "AGENTS.md",
   "CLAUDE.md",
@@ -1750,7 +1863,7 @@ function normalizeInstructionPath(value) {
   const normalized = value.trim().replace(/\\/g, "/");
   if (!normalized)
     return null;
-  const collapsed = path9.posix.normalize(normalized);
+  const collapsed = path10.posix.normalize(normalized);
   if (collapsed === "." || collapsed === ".." || collapsed.startsWith("../") || collapsed.startsWith("/")) {
     return null;
   }
@@ -1794,29 +1907,29 @@ var SyncService = class {
   changelogLog = new ScalableLogService(CHANGELOG_DIR);
   async getQueueDir() {
     const dir = await getVemDir();
-    const queueDir = path9.join(dir, "queue");
-    await fs9.ensureDir(queueDir);
+    const queueDir = path10.join(dir, "queue");
+    await fs10.ensureDir(queueDir);
     return queueDir;
   }
   async getContextPath() {
     const dir = await getVemDir();
-    return path9.join(dir, CONTEXT_FILE);
+    return path10.join(dir, CONTEXT_FILE);
   }
   async getCurrentStatePath() {
     const dir = await getVemDir();
-    return path9.join(dir, CURRENT_STATE_FILE);
+    return path10.join(dir, CURRENT_STATE_FILE);
   }
   async collectAgentInstructionFiles() {
     const repoRoot = await getRepoRoot();
     const files = [];
     for (const relativePath of KNOWN_AGENT_INSTRUCTION_FILES) {
-      const absolutePath = path9.join(repoRoot, relativePath);
-      if (!await fs9.pathExists(absolutePath))
+      const absolutePath = path10.join(repoRoot, relativePath);
+      if (!await fs10.pathExists(absolutePath))
         continue;
-      const stat = await fs9.stat(absolutePath);
+      const stat = await fs10.stat(absolutePath);
       if (!stat.isFile())
         continue;
-      const content = await fs9.readFile(absolutePath, "utf-8");
+      const content = await fs10.readFile(absolutePath, "utf-8");
       files.push({ path: relativePath, content });
     }
     return files;
@@ -1825,19 +1938,19 @@ var SyncService = class {
     if (!Array.isArray(entries) || entries.length === 0)
       return;
     const repoRoot = await getRepoRoot();
-    const resolvedRoot = path9.resolve(repoRoot);
+    const resolvedRoot = path10.resolve(repoRoot);
     for (const entry of entries) {
       const normalizedPath = normalizeInstructionPath(entry?.path);
       if (!normalizedPath)
         continue;
       if (typeof entry.content !== "string")
         continue;
-      const destination = path9.resolve(repoRoot, normalizedPath);
-      if (destination !== resolvedRoot && !destination.startsWith(`${resolvedRoot}${path9.sep}`)) {
+      const destination = path10.resolve(repoRoot, normalizedPath);
+      if (destination !== resolvedRoot && !destination.startsWith(`${resolvedRoot}${path10.sep}`)) {
         continue;
       }
-      await fs9.ensureDir(path9.dirname(destination));
-      await fs9.writeFile(destination, entry.content, "utf-8");
+      await fs10.ensureDir(path10.dirname(destination));
+      await fs10.writeFile(destination, entry.content, "utf-8");
     }
   }
   async pack() {
@@ -1859,15 +1972,15 @@ var SyncService = class {
     };
     const contextPath = await this.getContextPath();
     let context = "";
-    if (await fs9.pathExists(contextPath)) {
-      const raw = await fs9.readFile(contextPath, "utf-8");
+    if (await fs10.pathExists(contextPath)) {
+      const raw = await fs10.readFile(contextPath, "utf-8");
       addSecretMatch(".vem/CONTEXT.md", raw);
       context = redactSecrets(raw);
     }
     const currentStatePath = await this.getCurrentStatePath();
     let currentState = "";
-    if (await fs9.pathExists(currentStatePath)) {
-      const raw = await fs9.readFile(currentStatePath, "utf-8");
+    if (await fs10.pathExists(currentStatePath)) {
+      const raw = await fs10.readFile(currentStatePath, "utf-8");
       addSecretMatch(".vem/CURRENT_STATE.md", raw);
       currentState = redactSecrets(raw);
     }
@@ -1987,7 +2100,7 @@ ${body}`;
   }
   async unpack(payload) {
     const vemDir = await getVemDir();
-    await fs9.ensureDir(vemDir);
+    await fs10.ensureDir(vemDir);
     const { storage, index } = await this.taskService.init();
     const taskIds = await storage.listIds();
     for (const id of taskIds) {
@@ -2007,7 +2120,7 @@ ${body}`;
     }
     await index.save(newIndexEntries);
     const contextPath = await this.getContextPath();
-    await fs9.writeFile(contextPath, payload.context, "utf-8");
+    await fs10.writeFile(contextPath, payload.context, "utf-8");
     if (payload.decisions) {
       await this.decisionsLog.addEntry("Imported from Sync", payload.decisions);
     }
@@ -2015,24 +2128,24 @@ ${body}`;
       await this.changelogLog.addEntry("Imported from Sync", payload.changelog);
     }
     const currentStatePath = await this.getCurrentStatePath();
-    await fs9.writeFile(currentStatePath, payload.current_state ?? "", "utf-8");
+    await fs10.writeFile(currentStatePath, payload.current_state ?? "", "utf-8");
     await this.unpackAgentInstructionFiles(payload.agent_instructions);
   }
   async enqueue(payload) {
     const queueDir = await this.getQueueDir();
     const id = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}.json`;
-    const filePath = path9.join(queueDir, id);
-    await fs9.writeJson(filePath, payload, { spaces: 2 });
+    const filePath = path10.join(queueDir, id);
+    await fs10.writeJson(filePath, payload, { spaces: 2 });
     return id;
   }
   async getQueue() {
     const queueDir = await this.getQueueDir();
-    const files = await fs9.readdir(queueDir);
+    const files = await fs10.readdir(queueDir);
     const queue = [];
     for (const file of files) {
       if (file.endsWith(".json")) {
         try {
-          const payload = await fs9.readJson(path9.join(queueDir, file));
+          const payload = await fs10.readJson(path10.join(queueDir, file));
           queue.push({ id: file, payload });
         } catch (error) {
           console.error(`Error reading queued snapshot ${file}:`, error);
@@ -2043,105 +2156,10 @@ ${body}`;
   }
   async removeFromQueue(id) {
     const queueDir = await this.getQueueDir();
-    const filePath = path9.join(queueDir, id);
-    if (await fs9.pathExists(filePath)) {
-      await fs9.remove(filePath);
+    const filePath = path10.join(queueDir, id);
+    if (await fs10.pathExists(filePath)) {
+      await fs10.remove(filePath);
     }
-  }
-};
-
-// ../../packages/core/dist/cycles.js
-import path10 from "path";
-import fs10 from "fs-extra";
-var CycleService = class {
-  async getCyclesDir() {
-    const vemDir = await getVemDir();
-    const dir = path10.join(vemDir, CYCLES_DIR);
-    await fs10.ensureDir(dir);
-    return dir;
-  }
-  cycleFilePath(dir, id) {
-    return path10.join(dir, `${id}.json`);
-  }
-  async getNextCycleId(dir) {
-    let maxNum = 0;
-    const entries = await fs10.readdir(dir).catch(() => []);
-    for (const entry of entries) {
-      const match = entry.match(/^CYCLE-(\d{3,})\.json$/);
-      if (match) {
-        const num = parseInt(match[1], 10);
-        if (!Number.isNaN(num) && num > maxNum) {
-          maxNum = num;
-        }
-      }
-    }
-    return `CYCLE-${String(maxNum + 1).padStart(3, "0")}`;
-  }
-  async createCycle(input) {
-    const dir = await this.getCyclesDir();
-    const id = await this.getNextCycleId(dir);
-    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-    const cycle = {
-      id,
-      name: input.name,
-      goal: input.goal,
-      appetite: input.appetite,
-      status: "planned",
-      start_at: input.start_at,
-      created_at: timestamp,
-      updated_at: timestamp
-    };
-    await fs10.writeJson(this.cycleFilePath(dir, id), cycle, { spaces: 2 });
-    return cycle;
-  }
-  async getCycles() {
-    const dir = await this.getCyclesDir();
-    const entries = await fs10.readdir(dir).catch(() => []);
-    const cycles = [];
-    for (const entry of entries) {
-      if (!entry.endsWith(".json"))
-        continue;
-      try {
-        const cycle = await fs10.readJson(path10.join(dir, entry));
-        if (cycle?.id)
-          cycles.push(cycle);
-      } catch {
-      }
-    }
-    return cycles.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-  }
-  async getCycle(id) {
-    const dir = await this.getCyclesDir();
-    const filePath = this.cycleFilePath(dir, id);
-    if (!await fs10.pathExists(filePath))
-      return null;
-    try {
-      return await fs10.readJson(filePath);
-    } catch {
-      return null;
-    }
-  }
-  async updateCycle(id, patch) {
-    const dir = await this.getCyclesDir();
-    const filePath = this.cycleFilePath(dir, id);
-    const current = await this.getCycle(id);
-    if (!current) {
-      throw new Error(`Cycle ${id} not found`);
-    }
-    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-    const updated = { ...current, ...patch, id, updated_at: timestamp };
-    if (patch.status === "active" && current.status !== "active") {
-      updated.start_at = updated.start_at ?? timestamp;
-    }
-    if (patch.status === "closed" && current.status !== "closed") {
-      updated.closed_at = updated.closed_at ?? timestamp;
-    }
-    await fs10.writeJson(filePath, updated, { spaces: 2 });
-    return updated;
-  }
-  async getActiveCycle() {
-    const cycles = await this.getCycles();
-    return cycles.find((c) => c.status === "active") ?? null;
   }
 };
 
@@ -3255,6 +3273,7 @@ ${JSON.stringify(updated, null, 2)}`
       const apiUrl = process.env.VEM_API_URL || "http://localhost:3002";
       const payload = { question };
       if (path11) payload.path = path11;
+      if (process.env.VEM_TASK_RUN_ID) payload.taskRunId = process.env.VEM_TASK_RUN_ID;
       const res = await fetch(`${apiUrl}/projects/${projectId}/ask`, {
         method: "POST",
         headers: {
