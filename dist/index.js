@@ -15,9 +15,6 @@ import {
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 
-// ../../packages/core/dist/provider-key-encryption.js
-import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
-
 // ../../packages/core/dist/agent.js
 import path6 from "path";
 
@@ -83,13 +80,19 @@ var TaskTypeSchema = z.enum([
   "enabler"
 ]);
 var CycleAppetiteSchema = z.enum(["small", "medium", "large"]);
-var CycleStatusSchema = z.enum(["planned", "active", "closed"]);
+var CycleStatusSchema = z.enum([
+  "planned",
+  "active",
+  "closed",
+  "archived"
+]);
 var CycleSchema = z.object({
   id: z.string(),
   name: z.string(),
   goal: z.string(),
   appetite: CycleAppetiteSchema.optional(),
   status: CycleStatusSchema,
+  validation_instructions: z.string().optional(),
   start_at: z.string().datetime().optional(),
   closed_at: z.string().datetime().optional(),
   created_at: z.string().datetime(),
@@ -134,6 +137,7 @@ var TaskSchema = z.object({
   estimate_hours: z.number().optional(),
   depends_on: z.array(z.string()).optional(),
   blocked_by: z.array(z.string()).optional(),
+  blocked_reason: z.string().optional(),
   recurrence_rule: z.string().optional(),
   owner_id: z.string().optional(),
   reviewer_id: z.string().optional(),
@@ -153,6 +157,8 @@ var TaskSchema = z.object({
   due_at: z.string().datetime().optional(),
   github_issue_number: z.number().optional(),
   deleted_at: z.string().datetime().optional(),
+  // Cloud UUID — persisted locally once known, eliminates future external_id lookups
+  db_id: z.string().uuid().optional(),
   // Context-Flow fields
   cycle_id: z.string().optional(),
   impact_score: z.number().min(0).max(100).optional(),
@@ -174,6 +180,7 @@ var TaskUpdateSchema = z.object({
   estimate_hours: z.number().optional(),
   depends_on: z.array(z.string()).optional(),
   blocked_by: z.array(z.string()).optional(),
+  blocked_reason: z.string().optional(),
   recurrence_rule: z.string().optional(),
   owner_id: z.string().optional(),
   reviewer_id: z.string().optional(),
@@ -205,6 +212,7 @@ var TaskCreateSchema = z.object({
   estimate_hours: z.number().optional(),
   depends_on: z.array(z.string()).optional(),
   blocked_by: z.array(z.string()).optional(),
+  blocked_reason: z.string().optional(),
   recurrence_rule: z.string().optional(),
   owner_id: z.string().optional(),
   reviewer_id: z.string().optional(),
@@ -230,6 +238,79 @@ var VemUpdateSchema = z.object({
   context: z.string().optional(),
   new_cycles: z.array(CycleCreateSchema).optional()
 });
+var VemReviewIssueSeveritySchema = z.preprocess((val) => {
+  if (val === "high" || val === "critical")
+    return "error";
+  if (val === "medium")
+    return "warning";
+  if (val === "low")
+    return "info";
+  return val;
+}, z.enum(["error", "warning", "info"]));
+var VemReviewIssueOverallStatusSchema = z.enum([
+  "pass",
+  "fail",
+  "warning"
+]);
+var CycleReviewIssueStatusSchema = z.enum([
+  "pending",
+  "resolved",
+  "dismissed"
+]);
+var CycleRunStatusSchema = z.enum([
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "cancelled"
+]);
+var ValidationScheduleSchema = z.enum(["manual", "daily", "weekly"]);
+var ValidationExecutionBackendSchema = z.enum(["local", "cloud"]);
+var VemReviewIssueSchema = z.object({
+  severity: VemReviewIssueSeveritySchema,
+  title: z.string(),
+  description: z.string().optional(),
+  file_path: z.string().optional(),
+  line_number: z.number().int().optional(),
+  suggestion: z.string().optional()
+});
+var VemReviewSchema = z.object({
+  cycle_run_id: z.string().optional(),
+  task_id: z.string().optional(),
+  issues: z.array(VemReviewIssueSchema),
+  summary: z.string().optional(),
+  overall_status: VemReviewIssueOverallStatusSchema.optional()
+});
+var CycleRunSchema = z.object({
+  id: z.string(),
+  cycle_id: z.string(),
+  project_id: z.string(),
+  org_id: z.string(),
+  status: CycleRunStatusSchema,
+  validation_instructions: z.string().optional().nullable(),
+  started_at: z.string().datetime().optional().nullable(),
+  completed_at: z.string().datetime().optional().nullable(),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime()
+});
+var CycleReviewIssueSchema = z.object({
+  id: z.string(),
+  cycle_run_id: z.string(),
+  task_id: z.string().optional().nullable(),
+  task_run_id: z.string().optional().nullable(),
+  task_external_id: z.string().optional().nullable(),
+  vem_review: z.unknown().optional().nullable(),
+  severity: VemReviewIssueSeveritySchema,
+  title: z.string(),
+  description: z.string().optional().nullable(),
+  file_path: z.string().optional().nullable(),
+  line_number: z.number().int().optional().nullable(),
+  suggestion: z.string().optional().nullable(),
+  overall_status: VemReviewIssueOverallStatusSchema.optional().nullable(),
+  status: CycleReviewIssueStatusSchema,
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime()
+});
 var WebhookEventSchema = z.enum([
   "task.created",
   "task.started",
@@ -254,7 +335,9 @@ var WebhookEventSchema = z.enum([
   "task_run.failed",
   "task_run.cancelled",
   "member.invited",
-  "member.joined"
+  "member.joined",
+  "plan.approved",
+  "plan.rejected"
 ]);
 var WebhookSchema = z.object({
   id: z.string().uuid(),
@@ -288,9 +371,63 @@ var WebhookDeliverySchema = z.object({
   error_message: z.string().nullable(),
   delivered_at: z.string().datetime()
 });
+var EnvironmentSchema = z.object({
+  id: z.string().uuid(),
+  project_id: z.string().uuid(),
+  name: z.string().min(1).max(64),
+  description: z.string().nullable().optional(),
+  branch_name: z.string().nullable().optional(),
+  current_commit_hash: z.string().nullable().optional(),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime()
+});
+var EnvironmentCreateSchema = z.object({
+  name: z.string().min(1, "Name is required").max(64),
+  description: z.string().optional(),
+  branch_name: z.string().optional()
+});
+var EnvironmentUpdateSchema = z.object({
+  name: z.string().min(1).max(64).optional(),
+  description: z.string().nullable().optional(),
+  branch_name: z.string().nullable().optional()
+});
+var DeploymentStatusSchema = z.enum(["success", "failure", "pending"]);
+var DeploymentSourceSchema = z.enum(["api", "branch_sync", "manual"]);
+var DeploymentEventSchema = z.object({
+  id: z.string().uuid(),
+  project_id: z.string().uuid(),
+  environment_id: z.string().uuid(),
+  task_id: z.string().uuid().nullable().optional(),
+  commit_hash: z.string().nullable().optional(),
+  status: DeploymentStatusSchema,
+  source: DeploymentSourceSchema,
+  triggered_by: z.string().nullable().optional(),
+  deployed_at: z.string().datetime(),
+  created_at: z.string().datetime()
+});
+var RecordDeploymentSchema = z.object({
+  commit_hash: z.string().min(1).optional(),
+  task_id: z.string().uuid().optional(),
+  status: DeploymentStatusSchema.optional().default("success")
+}).refine((d) => d.commit_hash || d.task_id, {
+  message: "Either commit_hash or task_id must be provided"
+});
+var TaskEnvironmentStatusSchema = z.object({
+  environment_id: z.string().uuid(),
+  environment_name: z.string(),
+  branch_name: z.string().nullable().optional(),
+  is_deployed: z.boolean(),
+  /** Latest deployed_at for this environment, if available */
+  deployed_at: z.string().datetime().nullable().optional(),
+  current_commit_hash: z.string().nullable().optional()
+});
 
 // ../../packages/core/dist/agent.js
 import fs6 from "fs-extra";
+
+// ../../packages/core/dist/cycles.js
+import path2 from "path";
+import fs2 from "fs-extra";
 
 // ../../packages/core/dist/fs.js
 import path from "path";
@@ -334,6 +471,118 @@ async function ensureVemFiles() {
   }
 }
 
+// ../../packages/core/dist/cycles.js
+var CycleService = class {
+  async getCyclesDir() {
+    const vemDir = await getVemDir();
+    const dir = path2.join(vemDir, CYCLES_DIR);
+    await fs2.ensureDir(dir);
+    return dir;
+  }
+  cycleFilePath(dir, id) {
+    return path2.join(dir, `${id}.json`);
+  }
+  async getNextCycleId(dir) {
+    let maxNum = 0;
+    const entries = await fs2.readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      const match = entry.match(/^CYCLE-(\d{3,})\.json$/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (!Number.isNaN(num) && num > maxNum) {
+          maxNum = num;
+        }
+      }
+    }
+    return `CYCLE-${String(maxNum + 1).padStart(3, "0")}`;
+  }
+  async createCycle(input) {
+    const dir = await this.getCyclesDir();
+    const id = await this.getNextCycleId(dir);
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const cycle = {
+      id,
+      name: input.name,
+      goal: input.goal,
+      appetite: input.appetite,
+      status: "planned",
+      start_at: input.start_at,
+      created_at: timestamp,
+      updated_at: timestamp
+    };
+    await fs2.writeJson(this.cycleFilePath(dir, id), cycle, { spaces: 2 });
+    return cycle;
+  }
+  async getCycles() {
+    const dir = await this.getCyclesDir();
+    const entries = await fs2.readdir(dir).catch(() => []);
+    const cycles = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".json"))
+        continue;
+      try {
+        const cycle = await fs2.readJson(path2.join(dir, entry));
+        if (cycle?.id)
+          cycles.push(cycle);
+      } catch {
+      }
+    }
+    return cycles.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+  async getCycle(id) {
+    const dir = await this.getCyclesDir();
+    const filePath = this.cycleFilePath(dir, id);
+    if (!await fs2.pathExists(filePath))
+      return null;
+    try {
+      return await fs2.readJson(filePath);
+    } catch {
+      return null;
+    }
+  }
+  async updateCycle(id, patch) {
+    const dir = await this.getCyclesDir();
+    const filePath = this.cycleFilePath(dir, id);
+    const current = await this.getCycle(id);
+    if (!current) {
+      throw new Error(`Cycle ${id} not found`);
+    }
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const updated = { ...current, ...patch, id, updated_at: timestamp };
+    if (patch.status === "active" && current.status !== "active") {
+      updated.start_at = updated.start_at ?? timestamp;
+    }
+    if (patch.status === "closed" && current.status !== "closed") {
+      updated.closed_at = updated.closed_at ?? timestamp;
+    }
+    await fs2.writeJson(filePath, updated, { spaces: 2 });
+    return updated;
+  }
+  async getActiveCycle() {
+    const cycles = await this.getCycles();
+    return cycles.find((c) => c.status === "active") ?? null;
+  }
+  async upsertCycle(cycle) {
+    const dir = await this.getCyclesDir();
+    await fs2.writeJson(this.cycleFilePath(dir, cycle.id), cycle, { spaces: 2 });
+    return cycle;
+  }
+  async replaceCycles(cycles) {
+    const dir = await this.getCyclesDir();
+    const entries = await fs2.readdir(dir).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.endsWith(".json"))
+        continue;
+      await fs2.remove(path2.join(dir, entry));
+    }
+    for (const cycle of cycles) {
+      await fs2.writeJson(this.cycleFilePath(dir, cycle.id), cycle, {
+        spaces: 2
+      });
+    }
+  }
+};
+
 // ../../packages/core/dist/git.js
 import { execSync } from "child_process";
 async function getGitHeadHash() {
@@ -363,8 +612,8 @@ async function getGitLastCommitForPath(filePath) {
 }
 
 // ../../packages/core/dist/logs.js
-import path2 from "path";
-import fs2 from "fs-extra";
+import path3 from "path";
+import fs3 from "fs-extra";
 var ScalableLogService = class {
   subDir;
   constructor(subDir) {
@@ -372,15 +621,15 @@ var ScalableLogService = class {
   }
   async getBaseDir() {
     const vemDir = await getVemDir();
-    const dir = path2.join(vemDir, this.subDir);
-    await fs2.ensureDir(dir);
+    const dir = path3.join(vemDir, this.subDir);
+    await fs3.ensureDir(dir);
     return dir;
   }
   async addEntry(title, content, options) {
     const baseDir = await this.getBaseDir();
     const timestamp = (/* @__PURE__ */ new Date()).toISOString();
     const id = `${timestamp.replace(/[:.]/g, "-")}-${title.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
-    const filePath = path2.join(baseDir, `${id}.md`);
+    const filePath = path3.join(baseDir, `${id}.md`);
     const commitLine = options?.commitHash ? `**Commit:** ${options.commitHash}
 
 ` : "";
@@ -390,17 +639,17 @@ var ScalableLogService = class {
 
 ${commitLine}${content}
 `;
-    await fs2.writeFile(filePath, fullContent, "utf-8");
+    await fs3.writeFile(filePath, fullContent, "utf-8");
     return id;
   }
   async getAllEntries() {
     const baseDir = await this.getBaseDir();
-    const files = await fs2.readdir(baseDir);
+    const files = await fs3.readdir(baseDir);
     const entries = [];
     for (const file of files) {
       if (file.endsWith(".md")) {
-        const content = await fs2.readFile(path2.join(baseDir, file), "utf-8");
-        const id = path2.parse(file).name;
+        const content = await fs3.readFile(path3.join(baseDir, file), "utf-8");
+        const id = path3.parse(file).name;
         const titleMatch = content.match(/^#\s+(.*)/);
         const title = titleMatch ? titleMatch[1] : id;
         entries.push({
@@ -408,7 +657,7 @@ ${commitLine}${content}
           title,
           content,
           created_at: id.substring(0, 19).replace(/-/g, (_m, offset) => offset === 10 ? "T" : offset === 13 || offset === 16 ? ":" : "-"),
-          file_path: path2.join(baseDir, file)
+          file_path: path3.join(baseDir, file)
         });
       }
     }
@@ -456,115 +705,20 @@ ${entry.content}`;
     if (toArchive.length === 0)
       return 0;
     const baseDir = await this.getBaseDir();
-    const archiveBase = path2.join(baseDir, "archive");
-    await fs2.ensureDir(archiveBase);
+    const archiveBase = path3.join(baseDir, "archive");
+    await fs3.ensureDir(archiveBase);
     for (const entry of toArchive) {
       const date = new Date(entry.created_at);
       const folder = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-      const targetDir = path2.join(archiveBase, folder);
-      await fs2.ensureDir(targetDir);
-      const src = path2.join(baseDir, `${entry.id}.md`);
-      const dest = path2.join(targetDir, `${entry.id}.md`);
-      if (await fs2.pathExists(src)) {
-        await fs2.move(src, dest, { overwrite: true });
+      const targetDir = path3.join(archiveBase, folder);
+      await fs3.ensureDir(targetDir);
+      const src = path3.join(baseDir, `${entry.id}.md`);
+      const dest = path3.join(targetDir, `${entry.id}.md`);
+      if (await fs3.pathExists(src)) {
+        await fs3.move(src, dest, { overwrite: true });
       }
     }
     return toArchive.length;
-  }
-};
-
-// ../../packages/core/dist/cycles.js
-import path3 from "path";
-import fs3 from "fs-extra";
-var CycleService = class {
-  async getCyclesDir() {
-    const vemDir = await getVemDir();
-    const dir = path3.join(vemDir, CYCLES_DIR);
-    await fs3.ensureDir(dir);
-    return dir;
-  }
-  cycleFilePath(dir, id) {
-    return path3.join(dir, `${id}.json`);
-  }
-  async getNextCycleId(dir) {
-    let maxNum = 0;
-    const entries = await fs3.readdir(dir).catch(() => []);
-    for (const entry of entries) {
-      const match = entry.match(/^CYCLE-(\d{3,})\.json$/);
-      if (match) {
-        const num = parseInt(match[1], 10);
-        if (!Number.isNaN(num) && num > maxNum) {
-          maxNum = num;
-        }
-      }
-    }
-    return `CYCLE-${String(maxNum + 1).padStart(3, "0")}`;
-  }
-  async createCycle(input) {
-    const dir = await this.getCyclesDir();
-    const id = await this.getNextCycleId(dir);
-    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-    const cycle = {
-      id,
-      name: input.name,
-      goal: input.goal,
-      appetite: input.appetite,
-      status: "planned",
-      start_at: input.start_at,
-      created_at: timestamp,
-      updated_at: timestamp
-    };
-    await fs3.writeJson(this.cycleFilePath(dir, id), cycle, { spaces: 2 });
-    return cycle;
-  }
-  async getCycles() {
-    const dir = await this.getCyclesDir();
-    const entries = await fs3.readdir(dir).catch(() => []);
-    const cycles = [];
-    for (const entry of entries) {
-      if (!entry.endsWith(".json"))
-        continue;
-      try {
-        const cycle = await fs3.readJson(path3.join(dir, entry));
-        if (cycle?.id)
-          cycles.push(cycle);
-      } catch {
-      }
-    }
-    return cycles.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-  }
-  async getCycle(id) {
-    const dir = await this.getCyclesDir();
-    const filePath = this.cycleFilePath(dir, id);
-    if (!await fs3.pathExists(filePath))
-      return null;
-    try {
-      return await fs3.readJson(filePath);
-    } catch {
-      return null;
-    }
-  }
-  async updateCycle(id, patch) {
-    const dir = await this.getCyclesDir();
-    const filePath = this.cycleFilePath(dir, id);
-    const current = await this.getCycle(id);
-    if (!current) {
-      throw new Error(`Cycle ${id} not found`);
-    }
-    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-    const updated = { ...current, ...patch, id, updated_at: timestamp };
-    if (patch.status === "active" && current.status !== "active") {
-      updated.start_at = updated.start_at ?? timestamp;
-    }
-    if (patch.status === "closed" && current.status !== "closed") {
-      updated.closed_at = updated.closed_at ?? timestamp;
-    }
-    await fs3.writeJson(filePath, updated, { spaces: 2 });
-    return updated;
-  }
-  async getActiveCycle() {
-    const cycles = await this.getCycles();
-    return cycles.find((c) => c.status === "active") ?? null;
   }
 };
 
@@ -830,6 +984,7 @@ var TaskService = class {
       estimate_hours: options?.estimate_hours,
       depends_on: options?.depends_on,
       blocked_by: options?.blocked_by,
+      blocked_reason: options?.blocked_reason,
       recurrence_rule: options?.recurrence_rule,
       owner_id: options?.owner_id,
       reviewer_id: options?.reviewer_id,
@@ -903,12 +1058,29 @@ var TaskService = class {
     const nextEstimate = taskPatch.estimate_hours ?? currentTask.estimate_hours;
     const nextDependsOn = dependsProvided ? normalizeStringArray(taskPatch.depends_on) ?? [] : currentTask.depends_on;
     const nextBlockedBy = blockedProvided ? normalizeStringArray(taskPatch.blocked_by) ?? [] : currentTask.blocked_by;
+    const blockedReasonProvided = hasOwn("blocked_reason");
+    const nextBlockedReason = blockedReasonProvided ? normalizeText(taskPatch.blocked_reason) : currentTask.blocked_reason;
     const nextRecurrence = taskPatch.recurrence_rule ?? currentTask.recurrence_rule;
     const nextOwner = taskPatch.owner_id ?? currentTask.owner_id;
     const nextReviewer = taskPatch.reviewer_id ?? currentTask.reviewer_id;
     const taskContextProvided = taskPatch.task_context !== void 0;
     const taskContextSummaryProvided = taskPatch.task_context_summary !== void 0;
-    const nextTaskContext = taskContextProvided ? normalizeText(taskPatch.task_context) : currentTask.task_context;
+    const nextTaskContext = taskContextProvided ? (() => {
+      const newCtx = normalizeText(taskPatch.task_context);
+      if (!newCtx)
+        return newCtx;
+      const prev = currentTask.task_context?.trim();
+      if (!prev)
+        return newCtx;
+      const dateLabel = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+      return `${prev}
+
+---
+
+**Iteration \xB7 ${dateLabel}**
+
+${newCtx}`;
+    })() : currentTask.task_context;
     let nextTaskContextSummary = taskContextSummaryProvided ? normalizeText(taskPatch.task_context_summary) : currentTask.task_context_summary;
     const nextValidationSteps = validationProvided ? normalizeStringArray(taskPatch.validation_steps) ?? [] : currentTask.validation_steps;
     const cycleIdProvided = hasOwn("cycle_id");
@@ -925,6 +1097,9 @@ var TaskService = class {
       effectiveStatus = "blocked";
     } else if (!statusProvided && currentTask.status === "blocked") {
       effectiveStatus = "todo";
+    }
+    if (statusProvided && effectiveStatus === "blocked" && !hasBlocking && !nextBlockedReason) {
+      throw new Error("blocked_reason is required when setting a task status to blocked.");
     }
     if (effectiveStatus === "done" && currentTask.status !== "done") {
       if (!taskPatch.reasoning) {
@@ -1066,6 +1241,7 @@ var TaskService = class {
       estimate_hours: nextEstimate,
       depends_on: nextDependsOn,
       blocked_by: nextBlockedBy,
+      blocked_reason: effectiveStatus === "blocked" ? nextBlockedReason : void 0,
       recurrence_rule: nextRecurrence,
       owner_id: nextOwner,
       reviewer_id: nextReviewer,
@@ -1192,12 +1368,12 @@ var TaskService = class {
     const time_in_status = {};
     if (createdAtMs !== void 0) {
       if (readyAtMs !== void 0) {
-        time_in_status["todo"] = readyAtMs - createdAtMs;
+        time_in_status.todo = readyAtMs - createdAtMs;
         if (startedAtMs !== void 0) {
-          time_in_status["ready"] = startedAtMs - readyAtMs;
+          time_in_status.ready = startedAtMs - readyAtMs;
         }
       } else if (startedAtMs !== void 0) {
-        time_in_status["todo"] = startedAtMs - createdAtMs;
+        time_in_status.todo = startedAtMs - createdAtMs;
       }
     }
     if (startedAtMs !== void 0) {
@@ -1466,9 +1642,27 @@ async function writeCurrentState(value) {
     return false;
   const dir = await getVemDir();
   const currentStatePath = path6.join(dir, CURRENT_STATE_FILE);
-  const next = value.trim().length > 0 ? `${value.trim()}
-` : "";
-  await fs6.writeFile(currentStatePath, next, "utf-8");
+  const next = value.trim();
+  if (next.length === 0) {
+    await fs6.writeFile(currentStatePath, "", "utf-8");
+    return true;
+  }
+  let existing = "";
+  try {
+    existing = (await fs6.readFile(currentStatePath, "utf-8")).trim();
+  } catch {
+  }
+  const dateLabel = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const content = existing ? `${existing}
+
+---
+
+**Updated \xB7 ${dateLabel}**
+
+${next}
+` : `${next}
+`;
+  await fs6.writeFile(currentStatePath, content, "utf-8");
   return true;
 }
 async function writeContext(value) {
@@ -1739,6 +1933,9 @@ var commonEnvSchema = {
   DATABASE_URL: z2.string().url("DATABASE_URL must be a valid URL")
 };
 
+// ../../packages/core/dist/errors.js
+import { randomBytes } from "crypto";
+
 // ../../packages/core/dist/github-private-key.js
 import { createPrivateKey } from "crypto";
 
@@ -1747,7 +1944,6 @@ import pino from "pino";
 var isDev = process.env.NODE_ENV === "development";
 var logger = pino({
   level: process.env.LOG_LEVEL || "info",
-  // GCP Cloud Logging uses 'severity' instead of 'level'
   // We map pino levels to Google Cloud severity levels
   formatters: {
     level(label) {
@@ -1779,6 +1975,9 @@ var logger = pino({
     remove: true
   }
 });
+
+// ../../packages/core/dist/provider-key-encryption.js
+import { createCipheriv, createDecipheriv, randomBytes as randomBytes2 } from "crypto";
 
 // ../../packages/core/dist/secrets.js
 import { createHash as createHash2, timingSafeEqual } from "crypto";
@@ -1812,6 +2011,21 @@ var SECRET_PATTERNS = [
     name: "slack_token",
     regex: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
     replace: "[REDACTED:slack_token]"
+  },
+  {
+    name: "openai_api_key",
+    regex: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g,
+    replace: "[REDACTED:openai_api_key]"
+  },
+  {
+    name: "anthropic_api_key",
+    regex: /\bsk-ant-(?:api\d+-)?[A-Za-z0-9_-]{20,}\b/g,
+    replace: "[REDACTED:anthropic_api_key]"
+  },
+  {
+    name: "stripe_key",
+    regex: /\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b/g,
+    replace: "[REDACTED:stripe_key]"
   }
 ];
 function redactSecrets(input) {
@@ -2168,7 +2382,6 @@ import { join } from "path";
 import fs11 from "fs-extra";
 var UsageMetricsService = class _UsageMetricsService {
   metricsPath = null;
-  baseDir;
   /**
    * Power score weights for various features
    */
@@ -2184,7 +2397,6 @@ var UsageMetricsService = class _UsageMetricsService {
   static DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1e3;
   static DEFAULT_SYNC_TIMEOUT_MS = 7e3;
   constructor(baseDir) {
-    this.baseDir = baseDir;
     if (baseDir) {
       this.metricsPath = join(baseDir, ".usage-metrics.json");
     }
@@ -2601,7 +2813,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             type: {
               type: "string",
-              enum: ["feature", "bug", "chore"]
+              enum: ["feature", "bug", "chore", "spike", "enabler"]
             },
             parent_id: {
               type: "string",
@@ -2757,6 +2969,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             reasoning: {
               type: "string",
               description: "Explanation for the update. Required when blocking a task."
+            },
+            blocked_reason: {
+              type: "string",
+              description: "The reason why the task is blocked. Required when setting status to 'blocked'."
             },
             blocked_by: {
               type: "array",
@@ -3006,6 +3222,56 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Optional task ID for per-task metrics. If omitted, returns project-level summary."
             }
           }
+        }
+      },
+      {
+        name: "deposit_plan",
+        description: "Deposit a plan document (findings, recommendations, next steps) into the project. Call this at the end of a research, investigation, or planning run instead of creating a PR. The plan will be stored with status 'pending' for human review.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: {
+              type: "string",
+              description: "Short descriptive title for the plan."
+            },
+            body: {
+              type: "string",
+              description: "Markdown content: findings, recommendations, next steps. Supports full Markdown."
+            },
+            task_run_id: {
+              type: "string",
+              description: "Optional: the ID of the task run that generated this plan."
+            }
+          },
+          required: ["title", "body"]
+        }
+      },
+      {
+        name: "list_plans",
+        description: "List plans for the current project. Returns plan summaries with id, title, status, source, and date.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: {
+              type: "string",
+              enum: ["pending", "approved", "rejected", "done"],
+              description: "Optional filter by status."
+            }
+          }
+        }
+      },
+      {
+        name: "get_plan",
+        description: "Get the full content of a specific plan by its ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            plan_id: {
+              type: "string",
+              description: "The plan UUID."
+            }
+          },
+          required: ["plan_id"]
         }
       }
     ]
@@ -3273,7 +3539,8 @@ ${JSON.stringify(updated, null, 2)}`
       const apiUrl = process.env.VEM_API_URL || "http://localhost:3002";
       const payload = { question };
       if (path11) payload.path = path11;
-      if (process.env.VEM_TASK_RUN_ID) payload.taskRunId = process.env.VEM_TASK_RUN_ID;
+      if (process.env.VEM_TASK_RUN_ID)
+        payload.taskRunId = process.env.VEM_TASK_RUN_ID;
       const res = await fetch(`${apiUrl}/projects/${projectId}/ask`, {
         method: "POST",
         headers: {
@@ -3375,6 +3642,7 @@ ${currentState}`);
     const status = args?.status;
     const priority = args?.priority;
     const reasoning = args?.reasoning;
+    const blockedReason = args?.blocked_reason;
     const blockedBy = args?.blocked_by;
     const validationSteps = args?.validation_steps;
     if (!id) {
@@ -3390,13 +3658,13 @@ ${currentState}`);
         content: [{ type: "text", text: `Task ${id} not found.` }]
       };
     }
-    if (status === "blocked" && !reasoning) {
+    if (status === "blocked" && !blockedReason && !reasoning) {
       return {
         isError: true,
         content: [
           {
             type: "text",
-            text: "Reasoning is required when blocking a task."
+            text: "blocked_reason is required when blocking a task."
           }
         ]
       };
@@ -3416,6 +3684,8 @@ ${currentState}`);
     if (status) patch.status = status;
     if (priority) patch.priority = priority;
     if (reasoning) patch.reasoning = reasoning;
+    if (blockedReason) patch.blocked_reason = blockedReason;
+    else if (status === "blocked" && reasoning) patch.blocked_reason = reasoning;
     if (blockedBy) patch.blocked_by = blockedBy;
     if (validationSteps) patch.validation_steps = validationSteps;
     if (status && !reasoning) {
@@ -4082,7 +4352,9 @@ ${JSON.stringify(stats, null, 2)}`
       })),
       summary: `Active cycle: "${activeCycle.name}" \u2014 Goal: ${activeCycle.goal}. ${cycleTasks.length} task(s) assigned, ${cycleTasks.filter((t) => t.status === "done").length} done.`
     };
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+    };
   }
   if (name === "get_flow_metrics") {
     const taskId2 = args?.task_id;
@@ -4128,6 +4400,195 @@ ${JSON.stringify(stats, null, 2)}`
             null,
             2
           )
+        }
+      ]
+    };
+  }
+  if (name === "deposit_plan") {
+    const title = args?.title;
+    const body = args?.body;
+    const task_run_id = args?.task_run_id;
+    if (!title?.trim()) {
+      return {
+        content: [{ type: "text", text: "Error: title is required." }]
+      };
+    }
+    const apiKey = await configService.getApiKey();
+    if (!apiKey) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: not authenticated. Run `vem login` first."
+          }
+        ]
+      };
+    }
+    const projectId = await configService.getProjectId();
+    if (!projectId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: no project configured. Run `vem setup` first."
+          }
+        ]
+      };
+    }
+    const deviceHeaders = await buildDeviceHeaders(configService);
+    const res = await fetch(`${API_URL}/projects/${projectId}/project-plans`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        ...deviceHeaders
+      },
+      body: JSON.stringify({
+        title: title.trim(),
+        body,
+        task_run_id: task_run_id || void 0,
+        source: "agent"
+      })
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error depositing plan: ${data.error ?? res.statusText}`
+          }
+        ]
+      };
+    }
+    const { plan } = await res.json();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              success: true,
+              plan_id: plan.id,
+              title: plan.title,
+              status: plan.status,
+              message: "Plan deposited successfully and is pending review."
+            },
+            null,
+            2
+          )
+        }
+      ]
+    };
+  }
+  if (name === "list_plans") {
+    const status = args?.status;
+    const apiKey = await configService.getApiKey();
+    if (!apiKey) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: not authenticated. Run `vem login` first."
+          }
+        ]
+      };
+    }
+    const projectId = await configService.getProjectId();
+    if (!projectId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: no project configured. Run `vem setup` first."
+          }
+        ]
+      };
+    }
+    const deviceHeaders = await buildDeviceHeaders(configService);
+    const params = status ? `?status=${encodeURIComponent(status)}` : "";
+    const res = await fetch(
+      `${API_URL}/projects/${projectId}/project-plans${params}`,
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          ...deviceHeaders
+        }
+      }
+    );
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error fetching plans: ${data.error ?? res.statusText}`
+          }
+        ]
+      };
+    }
+    const { plans } = await res.json();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            plans.map((p) => ({
+              id: p.id,
+              title: p.title,
+              status: p.status,
+              source: p.source,
+              created_at: p.created_at
+            })),
+            null,
+            2
+          )
+        }
+      ]
+    };
+  }
+  if (name === "get_plan") {
+    const plan_id = args?.plan_id;
+    if (!plan_id) {
+      return {
+        content: [{ type: "text", text: "Error: plan_id is required." }]
+      };
+    }
+    const apiKey = await configService.getApiKey();
+    if (!apiKey) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: not authenticated. Run `vem login` first."
+          }
+        ]
+      };
+    }
+    const deviceHeaders = await buildDeviceHeaders(configService);
+    const res = await fetch(`${API_URL}/project-plans/${plan_id}`, {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        ...deviceHeaders
+      }
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error fetching plan: ${data.error ?? res.statusText}`
+          }
+        ]
+      };
+    }
+    const { plan } = await res.json();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(plan, null, 2)
         }
       ]
     };

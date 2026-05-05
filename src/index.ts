@@ -14,8 +14,8 @@ import {
 	CHANGELOG_DIR,
 	ConfigService,
 	CURRENT_STATE_FILE,
-	computeSessionStats,
 	CycleService,
+	computeSessionStats,
 	DECISIONS_DIR,
 	getRepoRoot,
 	getVemDir,
@@ -259,7 +259,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 						},
 						type: {
 							type: "string",
-							enum: ["feature", "bug", "chore"],
+							enum: ["feature", "bug", "chore", "spike", "enabler"],
 						},
 						parent_id: {
 							type: "string",
@@ -432,6 +432,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 							type: "string",
 							description:
 								"Explanation for the update. Required when blocking a task.",
+						},
+						blocked_reason: {
+							type: "string",
+							description:
+								"The reason why the task is blocked. Required when setting status to 'blocked'.",
 						},
 						blocked_by: {
 							type: "array",
@@ -703,6 +708,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 								"Optional task ID for per-task metrics. If omitted, returns project-level summary.",
 						},
 					},
+				},
+			},
+			{
+				name: "deposit_plan",
+				description:
+					"Deposit a plan document (findings, recommendations, next steps) into the project. Call this at the end of a research, investigation, or planning run instead of creating a PR. The plan will be stored with status 'pending' for human review.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						title: {
+							type: "string",
+							description: "Short descriptive title for the plan.",
+						},
+						body: {
+							type: "string",
+							description:
+								"Markdown content: findings, recommendations, next steps. Supports full Markdown.",
+						},
+						task_run_id: {
+							type: "string",
+							description:
+								"Optional: the ID of the task run that generated this plan.",
+						},
+					},
+					required: ["title", "body"],
+				},
+			},
+			{
+				name: "list_plans",
+				description:
+					"List plans for the current project. Returns plan summaries with id, title, status, source, and date.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						status: {
+							type: "string",
+							enum: ["pending", "approved", "rejected", "done"],
+							description: "Optional filter by status.",
+						},
+					},
+				},
+			},
+			{
+				name: "get_plan",
+				description: "Get the full content of a specific plan by its ID.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						plan_id: {
+							type: "string",
+							description: "The plan UUID.",
+						},
+					},
+					required: ["plan_id"],
 				},
 			},
 		],
@@ -1020,7 +1079,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 			const payload: any = { question };
 			if (path) payload.path = path;
-			if (process.env.VEM_TASK_RUN_ID) payload.taskRunId = process.env.VEM_TASK_RUN_ID;
+			if (process.env.VEM_TASK_RUN_ID)
+				payload.taskRunId = process.env.VEM_TASK_RUN_ID;
 
 			const res = await fetch(`${apiUrl}/projects/${projectId}/ask`, {
 				method: "POST",
@@ -1132,6 +1192,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		const status = args?.status as string | undefined;
 		const priority = args?.priority as string | undefined;
 		const reasoning = args?.reasoning as string | undefined;
+		const blockedReason = args?.blocked_reason as string | undefined;
 		const blockedBy = args?.blocked_by as string[] | undefined;
 		const validationSteps = args?.validation_steps as string[] | undefined;
 
@@ -1151,13 +1212,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		}
 
 		// Validate status transitions
-		if (status === "blocked" && !reasoning) {
+		if (status === "blocked" && !blockedReason && !reasoning) {
 			return {
 				isError: true,
 				content: [
 					{
 						type: "text",
-						text: "Reasoning is required when blocking a task.",
+						text: "blocked_reason is required when blocking a task.",
 					},
 				],
 			};
@@ -1179,6 +1240,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		if (status) patch.status = status;
 		if (priority) patch.priority = priority;
 		if (reasoning) patch.reasoning = reasoning;
+		if (blockedReason) patch.blocked_reason = blockedReason;
+		else if (status === "blocked" && reasoning) patch.blocked_reason = reasoning;
 		if (blockedBy) patch.blocked_by = blockedBy;
 		if (validationSteps) patch.validation_steps = validationSteps;
 
@@ -1922,7 +1985,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			})),
 			summary: `Active cycle: "${activeCycle.name}" — Goal: ${activeCycle.goal}. ${cycleTasks.length} task(s) assigned, ${cycleTasks.filter((t: any) => t.status === "done").length} done.`,
 		};
-		return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+		};
 	}
 
 	if (name === "get_flow_metrics") {
@@ -1970,6 +2035,227 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 						null,
 						2,
 					),
+				},
+			],
+		};
+	}
+
+	// ── Plans tools ──────────────────────────────────────────────────────────────
+
+	if (name === "deposit_plan") {
+		const title = args?.title as string;
+		const body = args?.body as string;
+		const task_run_id = args?.task_run_id as string | undefined;
+
+		if (!title?.trim()) {
+			return {
+				content: [{ type: "text", text: "Error: title is required." }],
+			};
+		}
+
+		const apiKey = await configService.getApiKey();
+		if (!apiKey) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Error: not authenticated. Run `vem login` first.",
+					},
+				],
+			};
+		}
+
+		const projectId = await configService.getProjectId();
+		if (!projectId) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Error: no project configured. Run `vem setup` first.",
+					},
+				],
+			};
+		}
+
+		const deviceHeaders = await buildDeviceHeaders(configService);
+
+		const res = await fetch(`${API_URL}/projects/${projectId}/project-plans`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+				...deviceHeaders,
+			},
+			body: JSON.stringify({
+				title: title.trim(),
+				body,
+				task_run_id: task_run_id || undefined,
+				source: "agent",
+			}),
+		});
+
+		if (!res.ok) {
+			const data = await res.json().catch(() => ({}));
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Error depositing plan: ${(data as { error?: string }).error ?? res.statusText}`,
+					},
+				],
+			};
+		}
+
+		const { plan } = await res.json();
+		return {
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(
+						{
+							success: true,
+							plan_id: plan.id,
+							title: plan.title,
+							status: plan.status,
+							message: "Plan deposited successfully and is pending review.",
+						},
+						null,
+						2,
+					),
+				},
+			],
+		};
+	}
+
+	if (name === "list_plans") {
+		const status = args?.status as string | undefined;
+
+		const apiKey = await configService.getApiKey();
+		if (!apiKey) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Error: not authenticated. Run `vem login` first.",
+					},
+				],
+			};
+		}
+
+		const projectId = await configService.getProjectId();
+		if (!projectId) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Error: no project configured. Run `vem setup` first.",
+					},
+				],
+			};
+		}
+
+		const deviceHeaders = await buildDeviceHeaders(configService);
+		const params = status ? `?status=${encodeURIComponent(status)}` : "";
+
+		const res = await fetch(
+			`${API_URL}/projects/${projectId}/project-plans${params}`,
+			{
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					...deviceHeaders,
+				},
+			},
+		);
+
+		if (!res.ok) {
+			const data = await res.json().catch(() => ({}));
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Error fetching plans: ${(data as { error?: string }).error ?? res.statusText}`,
+					},
+				],
+			};
+		}
+
+		const { plans } = await res.json();
+		return {
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(
+						(
+							plans as {
+								id: string;
+								title: string;
+								status: string;
+								source: string;
+								created_at: string;
+							}[]
+						).map((p) => ({
+							id: p.id,
+							title: p.title,
+							status: p.status,
+							source: p.source,
+							created_at: p.created_at,
+						})),
+						null,
+						2,
+					),
+				},
+			],
+		};
+	}
+
+	if (name === "get_plan") {
+		const plan_id = args?.plan_id as string;
+
+		if (!plan_id) {
+			return {
+				content: [{ type: "text", text: "Error: plan_id is required." }],
+			};
+		}
+
+		const apiKey = await configService.getApiKey();
+		if (!apiKey) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Error: not authenticated. Run `vem login` first.",
+					},
+				],
+			};
+		}
+
+		const deviceHeaders = await buildDeviceHeaders(configService);
+
+		const res = await fetch(`${API_URL}/project-plans/${plan_id}`, {
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				...deviceHeaders,
+			},
+		});
+
+		if (!res.ok) {
+			const data = await res.json().catch(() => ({}));
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Error fetching plan: ${(data as { error?: string }).error ?? res.statusText}`,
+					},
+				],
+			};
+		}
+
+		const { plan } = await res.json();
+		return {
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(plan, null, 2),
 				},
 			],
 		};
