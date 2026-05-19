@@ -4,7 +4,7 @@ import "./chunk-CSA73CBK.js";
 import "./chunk-WYWBLQNM.js";
 
 // src/index.ts
-import { execSync as execSync2 } from "child_process";
+import { execSync as execSync4 } from "child_process";
 import { createHash as createHash4 } from "crypto";
 import { readdir, readFile, readlink, writeFile } from "fs/promises";
 import { join as join2, relative } from "path";
@@ -88,6 +88,7 @@ var CycleStatusSchema = z.enum([
 ]);
 var CycleSchema = z.object({
   id: z.string(),
+  db_id: z.string().uuid().optional(),
   name: z.string(),
   goal: z.string(),
   appetite: CycleAppetiteSchema.optional(),
@@ -163,7 +164,8 @@ var TaskSchema = z.object({
   cycle_id: z.string().optional(),
   impact_score: z.number().min(0).max(100).optional(),
   ready_at: z.string().datetime().optional(),
-  started_at: z.string().datetime().optional()
+  started_at: z.string().datetime().optional(),
+  acceptance_criteria: z.array(z.string()).optional()
 });
 var TaskListSchema = z.object({
   tasks: z.array(TaskSchema)
@@ -199,7 +201,8 @@ var TaskUpdateSchema = z.object({
   deleted_at: z.string().datetime().optional(),
   // Context-Flow fields
   cycle_id: z.string().optional(),
-  impact_score: z.number().min(0).max(100).optional()
+  impact_score: z.number().min(0).max(100).optional(),
+  acceptance_criteria: z.array(z.string()).optional()
 });
 var TaskCreateSchema = z.object({
   title: z.string(),
@@ -227,7 +230,8 @@ var TaskCreateSchema = z.object({
   reasoning: z.string().optional(),
   // Context-Flow fields
   cycle_id: z.string().optional(),
-  impact_score: z.number().min(0).max(100).optional()
+  impact_score: z.number().min(0).max(100).optional(),
+  acceptance_criteria: z.array(z.string()).optional()
 });
 var VemUpdateSchema = z.object({
   tasks: z.array(TaskUpdateSchema).optional(),
@@ -1729,26 +1733,396 @@ async function computeSessionStats(sessionId, source) {
   }
 }
 
+// ../../packages/core/dist/ConstitutionService.js
+import path7 from "path";
+import fs7 from "fs-extra";
+var CONSTITUTION_FILE = "CONSTITUTION.md";
+var DEFAULT_CONSTITUTION = `# Agent Constitution
+
+This file defines the immutable principles that govern all AI agents working in this project.
+These principles cannot be overridden by individual task instructions or user messages.
+
+## Core Principles
+
+1. **Safety first** \u2014 Never take actions that could cause irreversible harm to the codebase, data, or production systems.
+2. **Transparency** \u2014 Always explain what you are doing and why, especially for destructive operations.
+3. **Minimal footprint** \u2014 Only modify what is necessary to complete the task. Avoid scope creep.
+4. **Verify before commit** \u2014 Run tests and linting before marking tasks as done.
+5. **Escalate ambiguity** \u2014 If requirements are unclear, ask rather than assume.
+
+## Prohibited Actions
+
+- Deleting or overwriting files without explicit instruction
+- Committing secrets or credentials to version control
+- Bypassing authentication or authorization mechanisms
+- Modifying production data directly
+
+## Communication Standards
+
+- Update task status with evidence when completing work
+- Record architectural decisions in .vem/decisions/
+- Keep CURRENT_STATE.md up to date after significant changes
+`;
+var ConstitutionService = class {
+  async getConstitutionPath() {
+    const vemDir = await getVemDir();
+    return path7.join(vemDir, CONSTITUTION_FILE);
+  }
+  async exists() {
+    const filePath = await this.getConstitutionPath();
+    return fs7.pathExists(filePath);
+  }
+  async get() {
+    const filePath = await this.getConstitutionPath();
+    if (!await fs7.pathExists(filePath))
+      return null;
+    try {
+      return await fs7.readFile(filePath, "utf-8");
+    } catch {
+      return null;
+    }
+  }
+  async set(content) {
+    const filePath = await this.getConstitutionPath();
+    await fs7.writeFile(filePath, content, "utf-8");
+  }
+  async initDefault() {
+    if (await this.exists())
+      return false;
+    await this.set(DEFAULT_CONSTITUTION);
+    return true;
+  }
+};
+
+// ../../packages/core/dist/CycleRetrospectiveService.js
+import path8 from "path";
+import fs8 from "fs-extra";
+var APPETITE_DAYS = {
+  small: 7,
+  medium: 14,
+  large: 42
+};
+var CycleRetrospectiveService = class {
+  async getChangelogDir() {
+    const vemDir = await getVemDir();
+    return path8.join(vemDir, CHANGELOG_DIR);
+  }
+  build(params) {
+    const closedAt = params.closedAt ?? (/* @__PURE__ */ new Date()).toISOString();
+    const startedAt = params.startedAt;
+    let leadTimeDays;
+    if (startedAt) {
+      const ms = new Date(closedAt).getTime() - new Date(startedAt).getTime();
+      leadTimeDays = Math.round(ms / (1e3 * 60 * 60 * 24));
+    }
+    const targetDays = params.appetite ? APPETITE_DAYS[params.appetite] : void 0;
+    const cycleTasks = params.tasks.filter((t) => t.cycle_id === params.cycleId && !t.deleted_at);
+    const completedTasks = cycleTasks.filter((t) => t.status === "done").map((t) => ({
+      id: t.id,
+      title: t.title,
+      status: t.status,
+      evidence: t.evidence
+    }));
+    const deferredTasks = cycleTasks.filter((t) => t.status !== "done" && !t.deleted_at).map((t) => ({ id: t.id, title: t.title, status: t.status }));
+    const removedTasks = params.tasks.filter((t) => t.cycle_id === params.cycleId && t.deleted_at).map((t) => ({ id: t.id, title: t.title, status: t.status }));
+    const decisions = params.decisions.map((d) => ({
+      id: d.id,
+      title: d.title,
+      date: d.date ?? d.created_at ?? (/* @__PURE__ */ new Date()).toISOString()
+    }));
+    return {
+      cycleId: params.cycleId,
+      cycleName: params.cycleName,
+      cycleGoal: params.cycleGoal,
+      appetite: params.appetite,
+      startedAt,
+      closedAt,
+      leadTimeDays,
+      targetDays,
+      completedTasks,
+      deferredTasks,
+      removedTasks,
+      decisions,
+      totalValidationRuns: params.totalValidationRuns,
+      lastValidationStatus: params.lastValidationStatus,
+      openIssues: params.openIssues,
+      resolvedIssues: params.resolvedIssues,
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  toMarkdown(retro) {
+    const lines = [];
+    lines.push(`# Retrospective: ${retro.cycleName} (${retro.cycleId})`);
+    lines.push(`**Goal:** ${retro.cycleGoal}`);
+    lines.push(`**Generated:** ${new Date(retro.generatedAt).toLocaleDateString()}`);
+    lines.push("");
+    lines.push("## Cycle Summary");
+    if (retro.appetite)
+      lines.push(`- **Appetite:** ${retro.appetite}`);
+    if (retro.leadTimeDays !== void 0) {
+      const targetNote = retro.targetDays !== void 0 ? ` (target: ${retro.targetDays} days)` : "";
+      lines.push(`- **Duration:** ${retro.leadTimeDays} days${targetNote}`);
+    }
+    const total = retro.completedTasks.length + retro.deferredTasks.length + retro.removedTasks.length;
+    lines.push(`- **Velocity:** ${retro.completedTasks.length} done / ${retro.deferredTasks.length} deferred / ${retro.removedTasks.length} removed (${total} total)`);
+    lines.push("");
+    if (retro.completedTasks.length > 0) {
+      lines.push("## Completed Tasks");
+      for (const t of retro.completedTasks) {
+        const evidence = t.evidence ? ` \u2014 *${t.evidence}*` : "";
+        lines.push(`- \u2713 **${t.id}** ${t.title}${evidence}`);
+      }
+      lines.push("");
+    }
+    if (retro.deferredTasks.length > 0) {
+      lines.push("## Deferred Tasks");
+      for (const t of retro.deferredTasks) {
+        lines.push(`- \u21B7 **${t.id}** ${t.title} (${t.status})`);
+      }
+      lines.push("");
+    }
+    if (retro.decisions.length > 0) {
+      lines.push("## Decisions Made");
+      for (const d of retro.decisions) {
+        const dateStr = d.date ? new Date(d.date).toLocaleDateString() : "";
+        lines.push(`- \u{1F4CB} **${d.id}** ${d.title}${dateStr ? ` *(${dateStr})*` : ""}`);
+      }
+      lines.push("");
+    }
+    lines.push("## Validation Summary");
+    lines.push(`- **Runs:** ${retro.totalValidationRuns}`);
+    if (retro.lastValidationStatus) {
+      lines.push(`- **Last status:** ${retro.lastValidationStatus}`);
+    }
+    lines.push(`- **Issues:** ${retro.resolvedIssues} resolved, ${retro.openIssues} open`);
+    lines.push("");
+    return lines.join("\n");
+  }
+  async saveToChangelog(retro) {
+    const dir = await this.getChangelogDir();
+    await fs8.ensureDir(dir);
+    const filename = `${retro.cycleId}-retrospective.md`;
+    const filePath = path8.join(dir, filename);
+    await fs8.writeFile(filePath, this.toMarkdown(retro), "utf-8");
+    return filePath;
+  }
+};
+
+// ../../packages/core/dist/CycleValidationService.js
+import { execSync as execSync2 } from "child_process";
+import path9 from "path";
+import fs9 from "fs-extra";
+var CycleValidationService = class {
+  async getReportsDir() {
+    const vemDir = await getVemDir();
+    const dir = path9.join(vemDir, "cycle-reports");
+    await fs9.ensureDir(dir);
+    return dir;
+  }
+  async runPreflight(cycleTasks, sensorResults, decisions, gitDiff, rules) {
+    const errors = [];
+    const warnings = [];
+    const doneTasks = cycleTasks.filter((t) => t.status === "done");
+    const blockedTasks = cycleTasks.filter((t) => t.status === "blocked");
+    const tasksComplete = cycleTasks.length > 0 && doneTasks.length === cycleTasks.length;
+    if (rules.require_all_tasks_done_to_close && !tasksComplete) {
+      errors.push(`${cycleTasks.length - doneTasks.length} task(s) not done`);
+    } else if (!tasksComplete) {
+      warnings.push(`${cycleTasks.length - doneTasks.length} task(s) not done`);
+    }
+    if (rules.require_no_blocked_tasks && blockedTasks.length > 0) {
+      const ids = blockedTasks.map((t) => t.id).join(", ");
+      errors.push(`Blocked tasks: ${ids}`);
+    }
+    const tasksWithoutEvidence = [];
+    if (rules.require_evidence_on_done) {
+      for (const task of doneTasks) {
+        if (!task.evidence || task.evidence.trim() === "") {
+          tasksWithoutEvidence.push(task.id);
+        }
+      }
+      if (tasksWithoutEvidence.length > 0) {
+        warnings.push(`Tasks missing evidence: ${tasksWithoutEvidence.join(", ")}`);
+      }
+    }
+    const failedSensors = sensorResults.filter((r) => !r.passed);
+    for (const s of failedSensors) {
+      warnings.push(`Sensor '${s.name}' failed (exit ${s.exitCode})`);
+    }
+    const driftViolations = this.checkDrift(decisions, gitDiff);
+    for (const v of driftViolations) {
+      warnings.push(`Architecture drift: ${v.decisionId} violated at ${v.file}`);
+    }
+    const finalWarnings = [];
+    const finalErrors = [...errors];
+    if (rules.strict_mode) {
+      finalErrors.push(...warnings);
+    } else {
+      finalWarnings.push(...warnings);
+    }
+    const passed = finalErrors.length === 0;
+    return {
+      tasksComplete,
+      totalTasks: cycleTasks.length,
+      doneTasks: doneTasks.length,
+      blockedTasks: blockedTasks.length,
+      tasksWithoutEvidence,
+      sensorResults,
+      driftViolations,
+      passed,
+      warnings: finalWarnings,
+      errors: finalErrors,
+      ranAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  checkDrift(decisions, gitDiff) {
+    const violations = [];
+    if (!gitDiff)
+      return violations;
+    for (const decision of decisions) {
+      if (!decision.enforcement_pattern)
+        continue;
+      let regex;
+      try {
+        regex = new RegExp(decision.enforcement_pattern, "i");
+      } catch {
+        continue;
+      }
+      const diffLines = gitDiff.split("\n");
+      let currentFile = "";
+      let lineNum = 0;
+      for (const line of diffLines) {
+        if (line.startsWith("--- a/") || line.startsWith("+++ b/")) {
+          currentFile = line.replace(/^[+-]{3} [ab]\//, "");
+          lineNum = 0;
+          continue;
+        }
+        if (line.startsWith("@@")) {
+          const match = line.match(/@@ [^+]*\+(\d+)/);
+          lineNum = match ? parseInt(match[1], 10) - 1 : 0;
+          continue;
+        }
+        if (line.startsWith("+") && !line.startsWith("+++")) {
+          lineNum++;
+          const content = line.slice(1);
+          if (regex.test(content)) {
+            violations.push({
+              decisionId: decision.id,
+              decisionTitle: decision.title,
+              pattern: decision.enforcement_pattern,
+              file: currentFile,
+              line: String(lineNum),
+              match: content.trim().slice(0, 120)
+            });
+          }
+        } else if (!line.startsWith("-")) {
+          lineNum++;
+        }
+      }
+    }
+    return violations;
+  }
+  getGitDiffSince(since) {
+    try {
+      const ref = since ?? "HEAD~30";
+      return execSync2(`git diff ${ref}`, {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        maxBuffer: 10 * 1024 * 1024
+      }).toString();
+    } catch {
+      try {
+        return execSync2("git diff HEAD", {
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "pipe"]
+        }).toString();
+      } catch {
+        return "";
+      }
+    }
+  }
+  async saveReport(report) {
+    const dir = await this.getReportsDir();
+    const filePath = path9.join(dir, `${report.cycleId}.validation.json`);
+    await fs9.writeJson(filePath, report, { spaces: 2 });
+    return filePath;
+  }
+  async loadReport(cycleId) {
+    const dir = await this.getReportsDir();
+    const filePath = path9.join(dir, `${cycleId}.validation.json`);
+    if (!await fs9.pathExists(filePath))
+      return null;
+    try {
+      return await fs9.readJson(filePath);
+    } catch {
+      return null;
+    }
+  }
+  formatPreflightSummary(result) {
+    const statusIcon = result.passed ? "\u2713" : "\u2717";
+    const warnCount = result.warnings.length;
+    const errCount = result.errors.length;
+    const lines = [
+      `${statusIcon} Pre-flight: ${result.passed ? warnCount > 0 ? "WARN" : "PASS" : "FAIL"}`,
+      `  Tasks: ${result.doneTasks}/${result.totalTasks} done, ${result.blockedTasks} blocked`
+    ];
+    if (result.sensorResults.length > 0) {
+      const passed = result.sensorResults.filter((r) => r.passed).length;
+      lines.push(`  Sensors: ${passed}/${result.sensorResults.length} passed`);
+      for (const s of result.sensorResults.filter((r) => !r.passed)) {
+        lines.push(`    \u2717 ${s.name}: ${s.output.split("\n")[0]?.slice(0, 80) ?? "failed"}`);
+      }
+    }
+    if (result.driftViolations.length > 0) {
+      lines.push(`  Drift: ${result.driftViolations.length} violation(s)`);
+      for (const v of result.driftViolations.slice(0, 3)) {
+        lines.push(`    \u2717 ${v.decisionId}: ${v.file}:${v.line}`);
+      }
+    }
+    for (const err of result.errors) {
+      lines.push(`  \u2717 ${err}`);
+    }
+    for (const warn of result.warnings.slice(0, 5)) {
+      lines.push(`  \u26A0 ${warn}`);
+    }
+    return lines.join("\n");
+  }
+  formatSensorContextForAgent(results) {
+    if (results.length === 0)
+      return "";
+    const lines = results.map((r) => {
+      if (r.passed)
+        return `${r.name}: OK`;
+      const snippet = r.output.split("\n").filter((l) => l.trim()).slice(0, 8).join(" | ");
+      return `${r.name}: FAILED (exit ${r.exitCode}) \u2014 ${snippet}`;
+    });
+    return `
+
+[Pre-flight Sensor Results]
+${lines.join("\n")}`;
+  }
+};
+
 // ../../packages/core/dist/config.js
 import { randomUUID } from "crypto";
 import { homedir, hostname } from "os";
-import path7 from "path";
-import fs7 from "fs-extra";
+import path10 from "path";
+import fs10 from "fs-extra";
 var CONFIG_FILE = "config.json";
 var ConfigService = class {
   async getLocalPath() {
     const dir = await getVemDir();
-    return path7.join(dir, CONFIG_FILE);
+    return path10.join(dir, CONFIG_FILE);
   }
   getGlobalPath() {
-    return path7.join(homedir(), ".vem", CONFIG_FILE);
+    return path10.join(homedir(), ".vem", CONFIG_FILE);
   }
   async readLocalConfig() {
     try {
       const filePath = await this.getLocalPath();
-      if (!await fs7.pathExists(filePath))
+      if (!await fs10.pathExists(filePath))
         return {};
-      return fs7.readJson(filePath);
+      return fs10.readJson(filePath);
     } catch {
       return {};
     }
@@ -1756,9 +2130,9 @@ var ConfigService = class {
   async readGlobalConfig() {
     try {
       const filePath = this.getGlobalPath();
-      if (!await fs7.pathExists(filePath))
+      if (!await fs10.pathExists(filePath))
         return {};
-      return fs7.readJson(filePath);
+      return fs10.readJson(filePath);
     } catch {
       return {};
     }
@@ -1770,6 +2144,7 @@ var ConfigService = class {
     const clean = {
       last_version: next.last_version,
       project_id: next.project_id,
+      project_name: next.project_name,
       project_org_id: next.project_org_id,
       linked_remote_name: next.linked_remote_name,
       linked_remote_url: next.linked_remote_url,
@@ -1777,7 +2152,7 @@ var ConfigService = class {
       last_push_vem_hash: next.last_push_vem_hash,
       last_synced_vem_hash: next.last_synced_vem_hash
     };
-    await fs7.outputJson(filePath, clean, { spaces: 2 });
+    await fs10.outputJson(filePath, clean, { spaces: 2 });
   }
   async writeGlobalConfig(update) {
     const filePath = this.getGlobalPath();
@@ -1788,7 +2163,7 @@ var ConfigService = class {
       device_id: next.device_id,
       device_name: next.device_name
     };
-    await fs7.outputJson(filePath, clean, { spaces: 2 });
+    await fs10.outputJson(filePath, clean, { spaces: 2 });
   }
   // --- Global Scoped ---
   async getApiKey() {
@@ -1870,6 +2245,13 @@ var ConfigService = class {
   async setProjectId(projectId) {
     await this.writeLocalConfig({ project_id: projectId || void 0 });
   }
+  async getProjectName() {
+    const config = await this.readLocalConfig();
+    return config.project_name;
+  }
+  async setProjectName(name) {
+    await this.writeLocalConfig({ project_name: name || void 0 });
+  }
   async setProjectOrgId(orgId) {
     await this.writeLocalConfig({ project_org_id: orgId || void 0 });
   }
@@ -1883,23 +2265,23 @@ var ConfigService = class {
   async getContextPath() {
     try {
       const dir = await getVemDir();
-      return path7.join(dir, CONTEXT_FILE);
+      return path10.join(dir, CONTEXT_FILE);
     } catch {
       return "";
     }
   }
   async getContext() {
     const filePath = await this.getContextPath();
-    if (!filePath || !await fs7.pathExists(filePath)) {
+    if (!filePath || !await fs10.pathExists(filePath)) {
       return "";
     }
-    return fs7.readFile(filePath, "utf-8");
+    return fs10.readFile(filePath, "utf-8");
   }
   async updateContext(content) {
     const filePath = await this.getContextPath();
     if (!filePath)
       throw new Error("Cannot update context: Not in a git repository.");
-    await fs7.writeFile(filePath, content, "utf-8");
+    await fs10.writeFile(filePath, content, "utf-8");
   }
   async recordDecision(title, context, decision, relatedTasks) {
     const decisionsLog = new ScalableLogService(DECISIONS_DIR);
@@ -1918,19 +2300,32 @@ ${entry}`;
 
 // ../../packages/core/dist/diff.js
 import { createHash } from "crypto";
-import path8 from "path";
-import fs8 from "fs-extra";
+import path11 from "path";
+import fs11 from "fs-extra";
 
 // ../../packages/core/dist/doctor.js
-import path9 from "path";
-import fs9 from "fs-extra";
+import path12 from "path";
+import fs12 from "fs-extra";
 
 // ../../packages/core/dist/env.js
 import { z as z2 } from "zod";
 var commonEnvSchema = {
   NODE_ENV: z2.enum(["development", "production", "test"]).default("development"),
-  INTERNAL_API_SECRET: z2.string().min(1, "INTERNAL_API_SECRET is required"),
-  DATABASE_URL: z2.string().url("DATABASE_URL must be a valid URL")
+  VEM_INTERNAL_SECRET: z2.string().min(1, "VEM_INTERNAL_SECRET is required"),
+  MAIN_DATABASE_URL: z2.string().url("MAIN_DATABASE_URL must be a valid URL")
+};
+var githubAppEnvSchema = {
+  GH_APP_ID: z2.string().min(1, "GH_APP_ID is required"),
+  GH_PRIVATE_KEY: z2.string().min(1, "GH_PRIVATE_KEY is required"),
+  GH_APP_NAME: z2.string().optional(),
+  GH_WEBHOOK_SECRET: z2.string().optional()
+};
+var sentryEnvSchema = {
+  SENTRY_RELEASE: z2.string().optional()
+};
+var aiModelsEnvSchema = {
+  VEM_DEFAULT_CHAT_MODEL: z2.string().optional(),
+  VEM_DEFAULT_EMBEDDING_MODEL: z2.string().optional()
 };
 
 // ../../packages/core/dist/errors.js
@@ -1943,7 +2338,7 @@ import { createPrivateKey } from "crypto";
 import pino from "pino";
 var isDev = process.env.NODE_ENV === "development";
 var logger = pino({
-  level: process.env.LOG_LEVEL || "info",
+  level: process.env.VEM_LOG_LEVEL || "info",
   // We map pino levels to Google Cloud severity levels
   formatters: {
     level(label) {
@@ -1978,6 +2373,117 @@ var logger = pino({
 
 // ../../packages/core/dist/provider-key-encryption.js
 import { createCipheriv, createDecipheriv, randomBytes as randomBytes2 } from "crypto";
+
+// ../../packages/core/dist/SensorsService.js
+import { execSync as execSync3 } from "child_process";
+import path13 from "path";
+import fs13 from "fs-extra";
+var SENSORS_FILE = "sensors.json";
+var SensorsService = class {
+  async getSensorsPath() {
+    const vemDir = await getVemDir();
+    return path13.join(vemDir, SENSORS_FILE);
+  }
+  async readConfig() {
+    const filePath = await this.getSensorsPath();
+    if (!await fs13.pathExists(filePath)) {
+      return { sensors: [] };
+    }
+    try {
+      const raw = await fs13.readJson(filePath);
+      if (Array.isArray(raw?.sensors)) {
+        return { sensors: raw.sensors };
+      }
+      return { sensors: [] };
+    } catch {
+      return { sensors: [] };
+    }
+  }
+  async writeConfig(config) {
+    const filePath = await this.getSensorsPath();
+    await fs13.writeJson(filePath, config, { spaces: 2 });
+  }
+  async addSensor(sensor) {
+    const config = await this.readConfig();
+    const existing = config.sensors.findIndex((s) => s.name === sensor.name);
+    if (existing !== -1) {
+      config.sensors[existing] = sensor;
+    } else {
+      config.sensors.push(sensor);
+    }
+    await this.writeConfig(config);
+  }
+  async removeSensor(name) {
+    const config = await this.readConfig();
+    const before = config.sensors.length;
+    config.sensors = config.sensors.filter((s) => s.name !== name);
+    if (config.sensors.length < before) {
+      await this.writeConfig(config);
+      return true;
+    }
+    return false;
+  }
+  async runSensor(sensor, cwd) {
+    const start = Date.now();
+    let output = "";
+    let exitCode = 0;
+    let passed = true;
+    try {
+      output = execSync3(sensor.cmd, {
+        cwd: cwd ?? process.cwd(),
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 12e4
+      }).toString();
+    } catch (err) {
+      passed = false;
+      if (err && typeof err === "object" && "stdout" in err) {
+        const e = err;
+        output = [
+          typeof e.stdout === "string" ? e.stdout : e.stdout?.toString() ?? "",
+          typeof e.stderr === "string" ? e.stderr : e.stderr?.toString() ?? ""
+        ].filter(Boolean).join("\n");
+        exitCode = e.status ?? 1;
+      } else {
+        output = err instanceof Error ? err.message : String(err);
+        exitCode = 1;
+      }
+    }
+    return {
+      name: sensor.name,
+      cmd: sensor.cmd,
+      passed,
+      exitCode,
+      output: output.trim().slice(0, 4e3),
+      durationMs: Date.now() - start,
+      ranAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  async runSensors(names, cwd) {
+    const config = await this.readConfig();
+    const toRun = names ? config.sensors.filter((s) => names.includes(s.name)) : config.sensors;
+    const results = [];
+    for (const sensor of toRun) {
+      results.push(await this.runSensor(sensor, cwd));
+    }
+    return results;
+  }
+  formatResultsForAgent(results) {
+    if (results.length === 0)
+      return "No sensors configured.";
+    const lines = results.map((r) => {
+      const status = r.passed ? "\u2713" : "\u2717";
+      const duration = `${r.durationMs}ms`;
+      if (r.passed) {
+        return `${status} ${r.name}: passed (${duration})`;
+      }
+      const snippet = r.output.split("\n").filter((l) => l.trim()).slice(0, 5).join(" | ");
+      return `${status} ${r.name}: FAILED (exit ${r.exitCode}, ${duration})
+  ${snippet}`;
+    });
+    return lines.join("\n");
+  }
+};
 
 // ../../packages/core/dist/secrets.js
 import { createHash as createHash2, timingSafeEqual } from "crypto";
@@ -2059,8 +2565,8 @@ function detectSecrets(input) {
 
 // ../../packages/core/dist/sync.js
 import { createHash as createHash3 } from "crypto";
-import path10 from "path";
-import fs10 from "fs-extra";
+import path14 from "path";
+import fs14 from "fs-extra";
 var KNOWN_AGENT_INSTRUCTION_FILES = [
   "AGENTS.md",
   "CLAUDE.md",
@@ -2077,7 +2583,7 @@ function normalizeInstructionPath(value) {
   const normalized = value.trim().replace(/\\/g, "/");
   if (!normalized)
     return null;
-  const collapsed = path10.posix.normalize(normalized);
+  const collapsed = path14.posix.normalize(normalized);
   if (collapsed === "." || collapsed === ".." || collapsed.startsWith("../") || collapsed.startsWith("/")) {
     return null;
   }
@@ -2121,29 +2627,29 @@ var SyncService = class {
   changelogLog = new ScalableLogService(CHANGELOG_DIR);
   async getQueueDir() {
     const dir = await getVemDir();
-    const queueDir = path10.join(dir, "queue");
-    await fs10.ensureDir(queueDir);
+    const queueDir = path14.join(dir, "queue");
+    await fs14.ensureDir(queueDir);
     return queueDir;
   }
   async getContextPath() {
     const dir = await getVemDir();
-    return path10.join(dir, CONTEXT_FILE);
+    return path14.join(dir, CONTEXT_FILE);
   }
   async getCurrentStatePath() {
     const dir = await getVemDir();
-    return path10.join(dir, CURRENT_STATE_FILE);
+    return path14.join(dir, CURRENT_STATE_FILE);
   }
   async collectAgentInstructionFiles() {
     const repoRoot = await getRepoRoot();
     const files = [];
     for (const relativePath of KNOWN_AGENT_INSTRUCTION_FILES) {
-      const absolutePath = path10.join(repoRoot, relativePath);
-      if (!await fs10.pathExists(absolutePath))
+      const absolutePath = path14.join(repoRoot, relativePath);
+      if (!await fs14.pathExists(absolutePath))
         continue;
-      const stat = await fs10.stat(absolutePath);
+      const stat = await fs14.stat(absolutePath);
       if (!stat.isFile())
         continue;
-      const content = await fs10.readFile(absolutePath, "utf-8");
+      const content = await fs14.readFile(absolutePath, "utf-8");
       files.push({ path: relativePath, content });
     }
     return files;
@@ -2152,19 +2658,19 @@ var SyncService = class {
     if (!Array.isArray(entries) || entries.length === 0)
       return;
     const repoRoot = await getRepoRoot();
-    const resolvedRoot = path10.resolve(repoRoot);
+    const resolvedRoot = path14.resolve(repoRoot);
     for (const entry of entries) {
       const normalizedPath = normalizeInstructionPath(entry?.path);
       if (!normalizedPath)
         continue;
       if (typeof entry.content !== "string")
         continue;
-      const destination = path10.resolve(repoRoot, normalizedPath);
-      if (destination !== resolvedRoot && !destination.startsWith(`${resolvedRoot}${path10.sep}`)) {
+      const destination = path14.resolve(repoRoot, normalizedPath);
+      if (destination !== resolvedRoot && !destination.startsWith(`${resolvedRoot}${path14.sep}`)) {
         continue;
       }
-      await fs10.ensureDir(path10.dirname(destination));
-      await fs10.writeFile(destination, entry.content, "utf-8");
+      await fs14.ensureDir(path14.dirname(destination));
+      await fs14.writeFile(destination, entry.content, "utf-8");
     }
   }
   async pack() {
@@ -2176,25 +2682,25 @@ var SyncService = class {
       includeCommitHashes: true
     });
     const secretMatches = [];
-    const addSecretMatch = (path11, value) => {
+    const addSecretMatch = (path16, value) => {
       if (!value)
         return;
       const types = detectSecrets(value);
       if (types.length > 0) {
-        secretMatches.push({ path: path11, types });
+        secretMatches.push({ path: path16, types });
       }
     };
     const contextPath = await this.getContextPath();
     let context = "";
-    if (await fs10.pathExists(contextPath)) {
-      const raw = await fs10.readFile(contextPath, "utf-8");
+    if (await fs14.pathExists(contextPath)) {
+      const raw = await fs14.readFile(contextPath, "utf-8");
       addSecretMatch(".vem/CONTEXT.md", raw);
       context = redactSecrets(raw);
     }
     const currentStatePath = await this.getCurrentStatePath();
     let currentState = "";
-    if (await fs10.pathExists(currentStatePath)) {
-      const raw = await fs10.readFile(currentStatePath, "utf-8");
+    if (await fs14.pathExists(currentStatePath)) {
+      const raw = await fs14.readFile(currentStatePath, "utf-8");
       addSecretMatch(".vem/CURRENT_STATE.md", raw);
       currentState = redactSecrets(raw);
     }
@@ -2314,7 +2820,7 @@ ${body}`;
   }
   async unpack(payload) {
     const vemDir = await getVemDir();
-    await fs10.ensureDir(vemDir);
+    await fs14.ensureDir(vemDir);
     const { storage, index } = await this.taskService.init();
     const taskIds = await storage.listIds();
     for (const id of taskIds) {
@@ -2334,7 +2840,7 @@ ${body}`;
     }
     await index.save(newIndexEntries);
     const contextPath = await this.getContextPath();
-    await fs10.writeFile(contextPath, payload.context, "utf-8");
+    await fs14.writeFile(contextPath, payload.context, "utf-8");
     if (payload.decisions) {
       await this.decisionsLog.addEntry("Imported from Sync", payload.decisions);
     }
@@ -2342,24 +2848,24 @@ ${body}`;
       await this.changelogLog.addEntry("Imported from Sync", payload.changelog);
     }
     const currentStatePath = await this.getCurrentStatePath();
-    await fs10.writeFile(currentStatePath, payload.current_state ?? "", "utf-8");
+    await fs14.writeFile(currentStatePath, payload.current_state ?? "", "utf-8");
     await this.unpackAgentInstructionFiles(payload.agent_instructions);
   }
   async enqueue(payload) {
     const queueDir = await this.getQueueDir();
     const id = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}.json`;
-    const filePath = path10.join(queueDir, id);
-    await fs10.writeJson(filePath, payload, { spaces: 2 });
+    const filePath = path14.join(queueDir, id);
+    await fs14.writeJson(filePath, payload, { spaces: 2 });
     return id;
   }
   async getQueue() {
     const queueDir = await this.getQueueDir();
-    const files = await fs10.readdir(queueDir);
+    const files = await fs14.readdir(queueDir);
     const queue = [];
     for (const file of files) {
       if (file.endsWith(".json")) {
         try {
-          const payload = await fs10.readJson(path10.join(queueDir, file));
+          const payload = await fs14.readJson(path14.join(queueDir, file));
           queue.push({ id: file, payload });
         } catch (error) {
           console.error(`Error reading queued snapshot ${file}:`, error);
@@ -2370,16 +2876,16 @@ ${body}`;
   }
   async removeFromQueue(id) {
     const queueDir = await this.getQueueDir();
-    const filePath = path10.join(queueDir, id);
-    if (await fs10.pathExists(filePath)) {
-      await fs10.remove(filePath);
+    const filePath = path14.join(queueDir, id);
+    if (await fs14.pathExists(filePath)) {
+      await fs14.remove(filePath);
     }
   }
 };
 
 // ../../packages/core/dist/usage-metrics.js
 import { join } from "path";
-import fs11 from "fs-extra";
+import fs15 from "fs-extra";
 var UsageMetricsService = class _UsageMetricsService {
   metricsPath = null;
   /**
@@ -2577,8 +3083,8 @@ var UsageMetricsService = class _UsageMetricsService {
   async loadMetrics() {
     try {
       const metricsPath = await this.getMetricsPath();
-      if (await fs11.pathExists(metricsPath)) {
-        const content = await fs11.readFile(metricsPath, "utf-8");
+      if (await fs15.pathExists(metricsPath)) {
+        const content = await fs15.readFile(metricsPath, "utf-8");
         return JSON.parse(content);
       }
     } catch (_error) {
@@ -2597,7 +3103,7 @@ var UsageMetricsService = class _UsageMetricsService {
    */
   async saveMetrics(data) {
     const metricsPath = await this.getMetricsPath();
-    await fs11.writeFile(metricsPath, JSON.stringify(data, null, 2), "utf-8");
+    await fs15.writeFile(metricsPath, JSON.stringify(data, null, 2), "utf-8");
   }
   isCloudSyncEnabled() {
     const disabled = (process.env.VEM_DISABLE_METRICS || "").toLowerCase();
@@ -2609,6 +3115,51 @@ var UsageMetricsService = class _UsageMetricsService {
       return false;
     }
     return true;
+  }
+};
+
+// ../../packages/core/dist/ValidationRulesService.js
+import path15 from "path";
+import fs16 from "fs-extra";
+var VALIDATION_RULES_FILE = "validation-rules.json";
+var DEFAULTS = {
+  require_evidence_on_done: true,
+  require_all_tasks_done_to_close: false,
+  run_sensors_on_validate: true,
+  trigger_ai_review_on_close: false,
+  require_no_blocked_tasks: true,
+  strict_mode: false,
+  preferred_backend: "local"
+};
+var ValidationRulesService = class {
+  async getRulesPath() {
+    const vemDir = await getVemDir();
+    return path15.join(vemDir, VALIDATION_RULES_FILE);
+  }
+  async readRules() {
+    const filePath = await this.getRulesPath();
+    if (!await fs16.pathExists(filePath)) {
+      return { ...DEFAULTS };
+    }
+    try {
+      const raw = await fs16.readJson(filePath);
+      return { ...DEFAULTS, ...raw };
+    } catch {
+      return { ...DEFAULTS };
+    }
+  }
+  async writeRules(rules) {
+    const current = await this.readRules();
+    const updated = { ...current, ...rules };
+    const filePath = await this.getRulesPath();
+    await fs16.writeJson(filePath, updated, { spaces: 2 });
+    return updated;
+  }
+  async ensureDefaultsFile() {
+    const filePath = await this.getRulesPath();
+    if (!await fs16.pathExists(filePath)) {
+      await fs16.writeJson(filePath, DEFAULTS, { spaces: 2 });
+    }
   }
 };
 
@@ -2633,6 +3184,11 @@ var cycleService = new CycleService();
 var configService = new ConfigService();
 var syncService = new SyncService();
 var metricsService = new UsageMetricsService();
+var sensorsService = new SensorsService();
+var cycleValidationService = new CycleValidationService();
+var cycleRetroService = new CycleRetrospectiveService();
+var constitutionService = new ConstitutionService();
+var validationRulesService = new ValidationRulesService();
 var API_URL = process.env.VEM_API_URL || "http://localhost:3002";
 async function trackHeartbeat(toolName, taskId) {
   try {
@@ -2660,21 +3216,21 @@ async function trackHeartbeat(toolName, taskId) {
 }
 function getGitHash() {
   try {
-    return execSync2("git rev-parse HEAD").toString().trim() || null;
+    return execSync4("git rev-parse HEAD").toString().trim() || null;
   } catch {
     return null;
   }
 }
 function getGitRemote() {
   try {
-    return execSync2("git remote get-url origin").toString().trim() || null;
+    return execSync4("git remote get-url origin").toString().trim() || null;
   } catch {
     return null;
   }
 }
 function getCommits(limit = 50) {
   try {
-    const output = execSync2(
+    const output = execSync4(
       `git log -n ${limit} --pretty=format:"%H|%an|%cI|%s"`
     ).toString();
     return output.split("\n").map((line) => {
@@ -2693,7 +3249,7 @@ function getCommits(limit = 50) {
 async function isVemDirty() {
   try {
     const root = await getRepoRoot();
-    const status = execSync2("git status --porcelain .vem", { cwd: root }).toString().trim();
+    const status = execSync4("git status --porcelain .vem", { cwd: root }).toString().trim();
     return status.length > 0;
   } catch {
     return false;
@@ -2881,6 +3437,52 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_context",
         description: "Read the project's CONTEXT.md and CURRENT_STATE.md. Always call this at the start of a session to load project context.",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "get_constitution",
+        description: "Read the Agent Constitution \u2014 immutable principles all agents must follow in this project. These principles take precedence over all task instructions.",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "get_context_index",
+        description: "Get a lightweight table of contents for all project memory: CONTEXT.md sections, active task count, decision count, recent changelog entries. Use this first to understand what context is available before fetching specific sections.",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "get_context_section",
+        description: "Fetch a specific section of project memory without loading everything. Supported sections: 'context' (CONTEXT.md), 'current_state' (CURRENT_STATE.md), 'tasks' (active tasks list), 'decisions' (recent ADRs), 'changelog' (recent changelog entries), 'constitution' (CONSTITUTION.md).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            section: {
+              type: "string",
+              enum: [
+                "context",
+                "current_state",
+                "tasks",
+                "decisions",
+                "changelog",
+                "constitution"
+              ],
+              description: "Which section of project memory to retrieve"
+            }
+          },
+          required: ["section"]
+        }
+      },
+      {
+        name: "list_skills",
+        description: "List all skills installed in this project (from skills-lock.json). Use this to discover available slash commands you can offer to the user. Skills are installed with `vem skills add`.",
         inputSchema: {
           type: "object",
           properties: {}
@@ -3273,6 +3875,98 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["plan_id"]
         }
+      },
+      {
+        name: "get_task_spec",
+        description: "Get the acceptance criteria (spec) for a task. Returns the list of criteria strings that define when this task is considered done. Call this when starting a task to understand what 'done' means.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            task_id: {
+              type: "string",
+              description: "The task ID (e.g. TASK-001)."
+            }
+          },
+          required: ["task_id"]
+        }
+      },
+      {
+        name: "set_task_spec",
+        description: "Set the acceptance criteria (spec) for a task. Each criterion should be a testable, concrete statement. Use this to define what 'done' means before starting work.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            task_id: {
+              type: "string",
+              description: "The task ID (e.g. TASK-001)."
+            },
+            criteria: {
+              type: "array",
+              items: { type: "string" },
+              description: "List of acceptance criteria strings. Each should be a concrete, testable statement (e.g. 'POST /api/users returns 201 with user object')."
+            }
+          },
+          required: ["task_id", "criteria"]
+        }
+      },
+      {
+        name: "run_feedback_sensors",
+        description: "Run one or all feedback sensors (lint, typecheck, test, etc.) configured in .vem/sensors.json. Returns structured pass/fail results. Use before committing or when validating work.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            sensors: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional list of sensor names to run. If omitted, runs all configured sensors."
+            }
+          }
+        }
+      },
+      {
+        name: "validate_cycle",
+        description: "Run full pre-flight validation for a cycle: checks task completeness, evidence quality, blocked tasks, sensor results, and architecture drift. Returns a structured report. Use this before closing a cycle to ensure quality gates pass.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cycle_id: {
+              type: "string",
+              description: "The cycle UUID (db_id). Use get_active_tasks or list cycles to find it."
+            },
+            skip_sensors: {
+              type: "boolean",
+              description: "Skip running feedback sensors (default: false)."
+            }
+          },
+          required: ["cycle_id"]
+        }
+      },
+      {
+        name: "get_cycle_health",
+        description: "Get a health snapshot for a cycle: task status breakdown, appetite progress, and last validation result.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cycle_id: {
+              type: "string",
+              description: "The cycle UUID (db_id). If omitted, uses the active cycle."
+            }
+          }
+        }
+      },
+      {
+        name: "get_cycle_retrospective",
+        description: "Generate or retrieve a retrospective for a cycle. Returns completed/deferred tasks, decisions made, and validation summary.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cycle_id: {
+              type: "string",
+              description: "The cycle UUID (db_id) to generate a retrospective for."
+            }
+          },
+          required: ["cycle_id"]
+        }
       }
     ]
   };
@@ -3444,9 +4138,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: "text",
-          text: `Task ${id} is now IN PROGRESS.
+          text: [
+            `Task ${id} is now IN PROGRESS.
 
-${JSON.stringify(updated, null, 2)}`
+${JSON.stringify(updated, null, 2)}`,
+            updated?.acceptance_criteria?.length ? `
+
+## Acceptance Criteria
+${updated.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : ""
+          ].join("")
         }
       ]
     };
@@ -3509,7 +4209,7 @@ ${JSON.stringify(updated, null, 2)}`
   }
   if (name === "ask_question") {
     const question = args?.question;
-    const path11 = args?.path;
+    const path16 = args?.path;
     const apiKey = await configService.getApiKey();
     const projectId = await configService.getProjectId();
     if (!apiKey) {
@@ -3538,7 +4238,7 @@ ${JSON.stringify(updated, null, 2)}`
       const { deviceId, deviceName } = await configService.getOrCreateDeviceId();
       const apiUrl = process.env.VEM_API_URL || "http://localhost:3002";
       const payload = { question };
-      if (path11) payload.path = path11;
+      if (path16) payload.path = path16;
       if (process.env.VEM_TASK_RUN_ID)
         payload.taskRunId = process.env.VEM_TASK_RUN_ID;
       const res = await fetch(`${apiUrl}/projects/${projectId}/ask`, {
@@ -3590,6 +4290,13 @@ ${JSON.stringify(updated, null, 2)}`
     } catch {
     }
     const parts = [];
+    const constitutionContent = await constitutionService.get();
+    if (constitutionContent)
+      parts.push(
+        `## Agent Constitution (Immutable Principles)
+
+${constitutionContent}`
+      );
     if (context) parts.push(`## CONTEXT.md
 
 ${context}`);
@@ -3601,6 +4308,58 @@ ${currentState}`);
         { type: "text", text: parts.join("\n\n---\n\n") || "(no context yet)" }
       ]
     };
+  }
+  if (name === "list_skills") {
+    try {
+      const repoRoot = await getRepoRoot();
+      const lockPath = join2(repoRoot, "skills-lock.json");
+      const raw = await readFile(lockPath, "utf-8");
+      const lock = JSON.parse(raw);
+      const skills = Object.entries(lock.skills ?? {}).map(([name2, skill]) => ({
+        name: name2,
+        source: skill.source,
+        skillPath: skill.skillPath,
+        slashCommand: `/${name2}`
+      }));
+      if (skills.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No skills installed. Use `vem skills add <source>` to install skills."
+            }
+          ]
+        };
+      }
+      const table = [
+        "| Skill | Slash Command | Source | Path |",
+        "|-------|---------------|--------|------|",
+        ...skills.map(
+          (s) => `| ${s.name} | \`${s.slashCommand}\` | ${s.source} | ${s.skillPath} |`
+        )
+      ].join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text: `## Installed Skills (${skills.length})
+
+Use these slash commands in your agent:
+
+${table}`
+          }
+        ]
+      };
+    } catch {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No skills-lock.json found. Use `vem skills add <source>` to install skills."
+          }
+        ]
+      };
+    }
   }
   if (name === "list_decisions") {
     const requestedLimit = args?.limit || 20;
@@ -3685,7 +4444,8 @@ ${currentState}`);
     if (priority) patch.priority = priority;
     if (reasoning) patch.reasoning = reasoning;
     if (blockedReason) patch.blocked_reason = blockedReason;
-    else if (status === "blocked" && reasoning) patch.blocked_reason = reasoning;
+    else if (status === "blocked" && reasoning)
+      patch.blocked_reason = reasoning;
     if (blockedBy) patch.blocked_by = blockedBy;
     if (validationSteps) patch.validation_steps = validationSteps;
     if (status && !reasoning) {
@@ -4591,6 +5351,425 @@ ${JSON.stringify(stats, null, 2)}`
           text: JSON.stringify(plan, null, 2)
         }
       ]
+    };
+  }
+  if (name === "validate_cycle") {
+    const cycleId = args.cycle_id;
+    const skipSensors = Boolean(args.skip_sensors);
+    if (!cycleId) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "cycle_id is required." }]
+      };
+    }
+    const cycle = await cycleService.getCycle(cycleId);
+    if (!cycle) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Cycle ${cycleId} not found.` }]
+      };
+    }
+    const tasks = await taskService.getTasks();
+    const cycleTasks = tasks.filter((t) => t.cycle_id === cycle.id && !t.deleted_at).map((t) => ({
+      id: t.id,
+      title: t.title,
+      status: t.status,
+      evidence: Array.isArray(t.evidence) ? t.evidence.join("; ") : t.evidence ?? void 0,
+      blocked_reason: t.blocked_reason ?? void 0
+    }));
+    let sensorResults = [];
+    if (!skipSensors) {
+      try {
+        sensorResults = await sensorsService.runSensors();
+      } catch {
+      }
+    }
+    const rules = await validationRulesService.readRules();
+    const cycleStartAt = cycle.start_at;
+    const since = cycleStartAt instanceof Date ? cycleStartAt.toISOString() : typeof cycleStartAt === "string" ? cycleStartAt : void 0;
+    const gitDiff = cycleValidationService.getGitDiffSince(since);
+    const preflight = await cycleValidationService.runPreflight(
+      cycleTasks,
+      sensorResults,
+      [],
+      gitDiff,
+      rules
+    );
+    const lines = [
+      `# Pre-flight Validation \u2014 ${cycleId}: ${cycle.name}
+`
+    ];
+    const overallIcon = preflight.passed ? "\u2705" : "\u274C";
+    lines.push(
+      `${overallIcon} **Overall**: ${preflight.passed ? "PASS" : `FAIL (${preflight.errors.length} error(s))`}`
+    );
+    lines.push(`- Tasks: ${preflight.doneTasks}/${preflight.totalTasks} done`);
+    lines.push(`- Without evidence: ${preflight.tasksWithoutEvidence.length}`);
+    lines.push(`- Blocked: ${preflight.blockedTasks}`);
+    if (sensorResults.length > 0) {
+      const passed = sensorResults.filter((r) => r.passed).length;
+      lines.push(`- Sensors: ${passed}/${sensorResults.length} passed`);
+    }
+    if (preflight.driftViolations.length > 0) {
+      lines.push(`- Drift violations: ${preflight.driftViolations.length}`);
+      for (const v of preflight.driftViolations.slice(0, 5)) {
+        lines.push(`  \u21B3 ${v.file}:${v.line} \u2014 ${v.decisionTitle}`);
+      }
+    } else {
+      lines.push("- Architecture drift: none detected");
+    }
+    if (preflight.warnings.length > 0) {
+      lines.push(`
+**Warnings:**`);
+      for (const w of preflight.warnings) lines.push(`  \u26A0 ${w}`);
+    }
+    if (preflight.errors.length > 0) {
+      lines.push(`
+**Errors:**`);
+      for (const e of preflight.errors) lines.push(`  \u2716 ${e}`);
+    }
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+  if (name === "run_feedback_sensors") {
+    const sensorNames = Array.isArray(args?.sensors) ? args.sensors : void 0;
+    const results = await sensorsService.runSensors(sensorNames);
+    if (results.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No sensors configured. Add sensors with: vem sensors add <name> --cmd <command>"
+          }
+        ]
+      };
+    }
+    const summary = sensorsService.formatResultsForAgent(results);
+    const allPassed = results.every((r) => r.passed);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Sensor results (${allPassed ? "ALL PASSED" : "SOME FAILED"}):
+
+${summary}`
+        }
+      ]
+    };
+  }
+  if (name === "get_cycle_health") {
+    const cycleId = args?.cycle_id;
+    const cycle = cycleId ? await cycleService.getCycle(cycleId) : await cycleService.getActiveCycle();
+    if (!cycle) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: cycleId ? `Cycle ${cycleId} not found.` : "No active cycle found."
+          }
+        ]
+      };
+    }
+    const tasks = await taskService.getTasks();
+    const cycleTasks = tasks.filter(
+      (t) => t.cycle_id === cycle.id && !t.deleted_at
+    );
+    const byStatus = cycleTasks.reduce((acc, t) => {
+      acc[t.status] = (acc[t.status] ?? 0) + 1;
+      return acc;
+    }, {});
+    const report = await cycleValidationService.loadReport(cycle.id);
+    const health = {
+      cycle: {
+        id: cycle.id,
+        name: cycle.name,
+        goal: cycle.goal,
+        appetite: cycle.appetite,
+        status: cycle.status
+      },
+      tasks: { total: cycleTasks.length, byStatus },
+      lastValidation: report ? {
+        ranAt: report.ranAt,
+        overallStatus: report.overallStatus,
+        errors: report.preflight.errors,
+        warnings: report.preflight.warnings
+      } : null
+    };
+    return {
+      content: [{ type: "text", text: JSON.stringify(health, null, 2) }]
+    };
+  }
+  if (name === "get_cycle_retrospective") {
+    const cycleId = args?.cycle_id;
+    if (!cycleId) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "cycle_id is required." }]
+      };
+    }
+    const cycle = await cycleService.getCycle(cycleId);
+    if (!cycle) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Cycle ${cycleId} not found.` }]
+      };
+    }
+    const tasks = await taskService.getTasks();
+    const retro = cycleRetroService.build({
+      cycleId: cycle.id,
+      cycleName: cycle.name,
+      cycleGoal: cycle.goal,
+      appetite: cycle.appetite,
+      startedAt: cycle.start_at,
+      closedAt: cycle.closed_at,
+      tasks: tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        evidence: t.evidence,
+        cycle_id: t.cycle_id,
+        deleted_at: t.deleted_at
+      })),
+      decisions: [],
+      totalValidationRuns: 0,
+      openIssues: 0,
+      resolvedIssues: 0
+    });
+    return {
+      content: [{ type: "text", text: cycleRetroService.toMarkdown(retro) }]
+    };
+  }
+  if (name === "get_task_spec") {
+    const taskId2 = args.task_id;
+    const task = await taskService.getTask(taskId2);
+    if (!task) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Task ${taskId2} not found.` }]
+      };
+    }
+    const criteria = task.acceptance_criteria ?? [];
+    if (criteria.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No acceptance criteria defined for task ${taskId2}: ${task.title}.
+
+Use set_task_spec to define what "done" means.`
+          }
+        ]
+      };
+    }
+    const lines = criteria.map((c, i) => `${i + 1}. ${c}`).join("\n");
+    return {
+      content: [
+        {
+          type: "text",
+          text: `# Acceptance Criteria \u2014 ${taskId2}: ${task.title}
+
+${lines}`
+        }
+      ]
+    };
+  }
+  if (name === "set_task_spec") {
+    const { task_id: taskId2, criteria } = args;
+    const task = await taskService.getTask(taskId2);
+    if (!task) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Task ${taskId2} not found.` }]
+      };
+    }
+    await taskService.updateTask(taskId2, {
+      acceptance_criteria: criteria
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `\u2714 Set ${criteria.length} acceptance criteria for ${taskId2}: ${task.title}.`
+        }
+      ]
+    };
+  }
+  if (name === "get_constitution") {
+    const constitutionContent = await constitutionService.get();
+    return {
+      content: [
+        {
+          type: "text",
+          text: constitutionContent ?? "(No constitution defined. Run `vem constitution init` to create one.)"
+        }
+      ]
+    };
+  }
+  if (name === "get_context_index") {
+    const vemDir = await getVemDir();
+    const parts = ["# Project Memory Index\n"];
+    try {
+      const contextRaw = await readFile(join2(vemDir, "CONTEXT.md"), "utf-8");
+      const headings = contextRaw.split("\n").filter((l) => l.startsWith("#")).slice(0, 10).map((l) => `  ${l}`);
+      parts.push(`## CONTEXT.md
+${headings.join("\n") || "  (no headings)"}`);
+    } catch {
+      parts.push("## CONTEXT.md\n  (not found)");
+    }
+    try {
+      const csRaw = await readFile(join2(vemDir, CURRENT_STATE_FILE), "utf-8");
+      const firstLine = csRaw.split("\n").find((l) => l.trim()) ?? "(empty)";
+      parts.push(`## CURRENT_STATE.md
+  ${firstLine}`);
+    } catch {
+      parts.push("## CURRENT_STATE.md\n  (not found)");
+    }
+    try {
+      const tasks = await taskService.getTasks();
+      const active = tasks.filter((t) => !t.deleted_at && t.status !== "done");
+      parts.push(
+        `## Tasks
+  ${active.length} active task(s) \xB7 use get_context_section(section: "tasks") for full list`
+      );
+    } catch {
+      parts.push("## Tasks\n  (unavailable)");
+    }
+    try {
+      const { readdir: readdir2 } = await import("fs/promises");
+      const decisionsDir = join2(vemDir, DECISIONS_DIR);
+      const files = await readdir2(decisionsDir).catch(() => []);
+      const count = files.filter((f) => f.endsWith(".md")).length;
+      parts.push(
+        `## Decisions
+  ${count} ADR(s) \xB7 use get_context_section(section: "decisions") for full list`
+      );
+    } catch {
+      parts.push("## Decisions\n  (unavailable)");
+    }
+    try {
+      const { readdir: readdir2 } = await import("fs/promises");
+      const changelogDir = join2(vemDir, CHANGELOG_DIR);
+      const files = await readdir2(changelogDir).catch(() => []);
+      const count = files.filter((f) => f.endsWith(".md")).length;
+      parts.push(
+        `## Changelog
+  ${count} entr(ies) \xB7 use get_context_section(section: "changelog") for recent entries`
+      );
+    } catch {
+      parts.push("## Changelog\n  (unavailable)");
+    }
+    const hasConstitution = await constitutionService.exists();
+    parts.push(
+      `## Constitution
+  ${hasConstitution ? "Defined \u2014 use get_constitution() to load" : "Not defined \u2014 run `vem constitution init`"}`
+    );
+    return {
+      content: [{ type: "text", text: parts.join("\n\n") }]
+    };
+  }
+  if (name === "get_context_section") {
+    const section = args.section;
+    const vemDir = await getVemDir();
+    if (section === "context") {
+      const content = await readFile(join2(vemDir, "CONTEXT.md"), "utf-8").catch(
+        () => "(CONTEXT.md not found)"
+      );
+      return { content: [{ type: "text", text: content }] };
+    }
+    if (section === "current_state") {
+      const content = await readFile(
+        join2(vemDir, CURRENT_STATE_FILE),
+        "utf-8"
+      ).catch(() => "(CURRENT_STATE.md not found)");
+      return { content: [{ type: "text", text: content }] };
+    }
+    if (section === "constitution") {
+      const content = await constitutionService.get();
+      return {
+        content: [
+          { type: "text", text: content ?? "(No constitution defined)" }
+        ]
+      };
+    }
+    if (section === "tasks") {
+      const tasks = await taskService.getTasks();
+      const active = tasks.filter((t) => !t.deleted_at && t.status !== "done");
+      if (active.length === 0) {
+        return { content: [{ type: "text", text: "No active tasks." }] };
+      }
+      const lines = active.map(
+        (t) => `- [${t.status}] ${t.id}: ${t.title}${t.blocked_reason ? ` \u26A0 ${t.blocked_reason}` : ""}`
+      );
+      return {
+        content: [
+          { type: "text", text: `# Active Tasks
+
+${lines.join("\n")}` }
+        ]
+      };
+    }
+    if (section === "decisions") {
+      const decisionsDir = join2(vemDir, DECISIONS_DIR);
+      const { readdir: readdir2 } = await import("fs/promises");
+      const files = await readdir2(decisionsDir).catch(() => []);
+      const mdFiles = files.filter((f) => f.endsWith(".md")).sort().slice(-10);
+      if (mdFiles.length === 0) {
+        return {
+          content: [{ type: "text", text: "No decisions recorded yet." }]
+        };
+      }
+      const contents = await Promise.all(
+        mdFiles.map(async (f) => {
+          const raw = await readFile(join2(decisionsDir, f), "utf-8").catch(
+            () => ""
+          );
+          return `### ${f}
+${raw.trim()}`;
+        })
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `# Architectural Decisions
+
+${contents.join("\n\n---\n\n")}`
+          }
+        ]
+      };
+    }
+    if (section === "changelog") {
+      const changelogDir = join2(vemDir, CHANGELOG_DIR);
+      const { readdir: readdir2 } = await import("fs/promises");
+      const files = await readdir2(changelogDir).catch(() => []);
+      const mdFiles = files.filter((f) => f.endsWith(".md")).sort().slice(-5);
+      if (mdFiles.length === 0) {
+        return {
+          content: [{ type: "text", text: "No changelog entries yet." }]
+        };
+      }
+      const contents = await Promise.all(
+        mdFiles.map(async (f) => {
+          const raw = await readFile(join2(changelogDir, f), "utf-8").catch(
+            () => ""
+          );
+          return `### ${f}
+${raw.trim()}`;
+        })
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `# Recent Changelog
+
+${contents.join("\n\n---\n\n")}`
+          }
+        ]
+      };
+    }
+    return {
+      isError: true,
+      content: [{ type: "text", text: `Unknown section: ${section}` }]
     };
   }
   throw new Error(`Tool not found: ${name}`);

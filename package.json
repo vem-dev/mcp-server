@@ -1,6 +1,6 @@
 {
 	"name": "@vemdev/mcp-server",
-	"version": "0.1.5",
+	"version": "0.1.6",
 	"description": "Official VEM MCP Server for AI agent project memory.",
 	"type": "module",
 	"license": "MIT",

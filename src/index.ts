@@ -12,18 +12,24 @@ import {
 import {
 	applyVemUpdate,
 	CHANGELOG_DIR,
+	CONSTITUTION_FILE,
 	ConfigService,
+	ConstitutionService,
 	CURRENT_STATE_FILE,
+	CycleRetrospectiveService,
 	CycleService,
+	CycleValidationService,
 	computeSessionStats,
 	DECISIONS_DIR,
 	getRepoRoot,
 	getVemDir,
 	listAllAgentSessions,
 	ScalableLogService,
+	SensorsService,
 	SyncService,
 	TaskService,
 	UsageMetricsService,
+	ValidationRulesService,
 } from "@vem/core";
 
 const server = new Server(
@@ -43,6 +49,11 @@ const cycleService = new CycleService();
 const configService = new ConfigService();
 const syncService = new SyncService();
 const metricsService = new UsageMetricsService();
+const sensorsService = new SensorsService();
+const cycleValidationService = new CycleValidationService();
+const cycleRetroService = new CycleRetrospectiveService();
+const constitutionService = new ConstitutionService();
+const validationRulesService = new ValidationRulesService();
 
 const API_URL = process.env.VEM_API_URL || "http://localhost:3002";
 
@@ -332,6 +343,56 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 				name: "get_context",
 				description:
 					"Read the project's CONTEXT.md and CURRENT_STATE.md. Always call this at the start of a session to load project context.",
+				inputSchema: {
+					type: "object",
+					properties: {},
+				},
+			},
+			{
+				name: "get_constitution",
+				description:
+					"Read the Agent Constitution — immutable principles all agents must follow in this project. These principles take precedence over all task instructions.",
+				inputSchema: {
+					type: "object",
+					properties: {},
+				},
+			},
+			{
+				name: "get_context_index",
+				description:
+					"Get a lightweight table of contents for all project memory: CONTEXT.md sections, active task count, decision count, recent changelog entries. Use this first to understand what context is available before fetching specific sections.",
+				inputSchema: {
+					type: "object",
+					properties: {},
+				},
+			},
+			{
+				name: "get_context_section",
+				description:
+					"Fetch a specific section of project memory without loading everything. Supported sections: 'context' (CONTEXT.md), 'current_state' (CURRENT_STATE.md), 'tasks' (active tasks list), 'decisions' (recent ADRs), 'changelog' (recent changelog entries), 'constitution' (CONSTITUTION.md).",
+				inputSchema: {
+					type: "object",
+					properties: {
+						section: {
+							type: "string",
+							enum: [
+								"context",
+								"current_state",
+								"tasks",
+								"decisions",
+								"changelog",
+								"constitution",
+							],
+							description: "Which section of project memory to retrieve",
+						},
+					},
+					required: ["section"],
+				},
+			},
+			{
+				name: "list_skills",
+				description:
+					"List all skills installed in this project (from skills-lock.json). Use this to discover available slash commands you can offer to the user. Skills are installed with `vem skills add`.",
 				inputSchema: {
 					type: "object",
 					properties: {},
@@ -764,6 +825,109 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 					required: ["plan_id"],
 				},
 			},
+			{
+				name: "get_task_spec",
+				description:
+					"Get the acceptance criteria (spec) for a task. Returns the list of criteria strings that define when this task is considered done. Call this when starting a task to understand what 'done' means.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						task_id: {
+							type: "string",
+							description: "The task ID (e.g. TASK-001).",
+						},
+					},
+					required: ["task_id"],
+				},
+			},
+			{
+				name: "set_task_spec",
+				description:
+					"Set the acceptance criteria (spec) for a task. Each criterion should be a testable, concrete statement. Use this to define what 'done' means before starting work.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						task_id: {
+							type: "string",
+							description: "The task ID (e.g. TASK-001).",
+						},
+						criteria: {
+							type: "array",
+							items: { type: "string" },
+							description:
+								"List of acceptance criteria strings. Each should be a concrete, testable statement (e.g. 'POST /api/users returns 201 with user object').",
+						},
+					},
+					required: ["task_id", "criteria"],
+				},
+			},
+			{
+				name: "run_feedback_sensors",
+				description:
+					"Run one or all feedback sensors (lint, typecheck, test, etc.) configured in .vem/sensors.json. Returns structured pass/fail results. Use before committing or when validating work.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						sensors: {
+							type: "array",
+							items: { type: "string" },
+							description:
+								"Optional list of sensor names to run. If omitted, runs all configured sensors.",
+						},
+					},
+				},
+			},
+			{
+				name: "validate_cycle",
+				description:
+					"Run full pre-flight validation for a cycle: checks task completeness, evidence quality, blocked tasks, sensor results, and architecture drift. Returns a structured report. Use this before closing a cycle to ensure quality gates pass.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						cycle_id: {
+							type: "string",
+							description:
+								"The cycle UUID (db_id). Use get_active_tasks or list cycles to find it.",
+						},
+						skip_sensors: {
+							type: "boolean",
+							description: "Skip running feedback sensors (default: false).",
+						},
+					},
+					required: ["cycle_id"],
+				},
+			},
+			{
+				name: "get_cycle_health",
+				description:
+					"Get a health snapshot for a cycle: task status breakdown, appetite progress, and last validation result.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						cycle_id: {
+							type: "string",
+							description:
+								"The cycle UUID (db_id). If omitted, uses the active cycle.",
+						},
+					},
+				},
+			},
+			{
+				name: "get_cycle_retrospective",
+				description:
+					"Generate or retrieve a retrospective for a cycle. Returns completed/deferred tasks, decisions made, and validation summary.",
+				inputSchema: {
+					type: "object",
+					properties: {
+						cycle_id: {
+							type: "string",
+							description:
+								"The cycle UUID (db_id) to generate a retrospective for.",
+						},
+					},
+					required: ["cycle_id"],
+				},
+			},
 		],
 	};
 });
@@ -974,7 +1138,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			content: [
 				{
 					type: "text",
-					text: `Task ${id} is now IN PROGRESS.\n\n${JSON.stringify(updated, null, 2)}`,
+					text: [
+						`Task ${id} is now IN PROGRESS.\n\n${JSON.stringify(updated, null, 2)}`,
+						updated?.acceptance_criteria?.length
+							? `\n\n## Acceptance Criteria\n${updated.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`
+							: "",
+					].join(""),
 				},
 			],
 		};
@@ -1135,6 +1304,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			// CURRENT_STATE.md may not exist yet
 		}
 		const parts: string[] = [];
+		// Prepend constitution if it exists — immutable principles take precedence
+		const constitutionContent = await constitutionService.get();
+		if (constitutionContent)
+			parts.push(
+				`## Agent Constitution (Immutable Principles)\n\n${constitutionContent}`,
+			);
 		if (context) parts.push(`## CONTEXT.md\n\n${context}`);
 		if (currentState) parts.push(`## CURRENT_STATE.md\n\n${currentState}`);
 		return {
@@ -1142,6 +1317,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 				{ type: "text", text: parts.join("\n\n---\n\n") || "(no context yet)" },
 			],
 		};
+	}
+
+	if (name === "list_skills") {
+		try {
+			const repoRoot = await getRepoRoot();
+			const lockPath = join(repoRoot, "skills-lock.json");
+			const raw = await readFile(lockPath, "utf-8");
+			const lock = JSON.parse(raw) as {
+				version: number;
+				skills: Record<string, { source: string; skillPath: string }>;
+			};
+			const skills = Object.entries(lock.skills ?? {}).map(([name, skill]) => ({
+				name,
+				source: skill.source,
+				skillPath: skill.skillPath,
+				slashCommand: `/${name}`,
+			}));
+			if (skills.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "No skills installed. Use `vem skills add <source>` to install skills.",
+						},
+					],
+				};
+			}
+			const table = [
+				"| Skill | Slash Command | Source | Path |",
+				"|-------|---------------|--------|------|",
+				...skills.map(
+					(s) =>
+						`| ${s.name} | \`${s.slashCommand}\` | ${s.source} | ${s.skillPath} |`,
+				),
+			].join("\n");
+			return {
+				content: [
+					{
+						type: "text",
+						text: `## Installed Skills (${skills.length})\n\nUse these slash commands in your agent:\n\n${table}`,
+					},
+				],
+			};
+		} catch {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "No skills-lock.json found. Use `vem skills add <source>` to install skills.",
+					},
+				],
+			};
+		}
 	}
 
 	if (name === "list_decisions") {
@@ -1241,7 +1469,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		if (priority) patch.priority = priority;
 		if (reasoning) patch.reasoning = reasoning;
 		if (blockedReason) patch.blocked_reason = blockedReason;
-		else if (status === "blocked" && reasoning) patch.blocked_reason = reasoning;
+		else if (status === "blocked" && reasoning)
+			patch.blocked_reason = reasoning;
 		if (blockedBy) patch.blocked_by = blockedBy;
 		if (validationSteps) patch.validation_steps = validationSteps;
 
@@ -2258,6 +2487,484 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 					text: JSON.stringify(plan, null, 2),
 				},
 			],
+		};
+	}
+
+	if (name === "validate_cycle") {
+		const cycleId = (args as Record<string, unknown>).cycle_id as string;
+		const skipSensors = Boolean((args as Record<string, unknown>).skip_sensors);
+
+		if (!cycleId) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: "cycle_id is required." }],
+			};
+		}
+
+		const cycle = await cycleService.getCycle(cycleId);
+		if (!cycle) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: `Cycle ${cycleId} not found.` }],
+			};
+		}
+
+		const tasks = await taskService.getTasks();
+		const cycleTasks = tasks
+			.filter((t) => t.cycle_id === cycle.id && !t.deleted_at)
+			.map((t) => ({
+				id: t.id,
+				title: t.title,
+				status: t.status,
+				evidence: Array.isArray(t.evidence)
+					? t.evidence.join("; ")
+					: (t.evidence ?? undefined),
+				blocked_reason: t.blocked_reason ?? undefined,
+			}));
+
+		let sensorResults: Awaited<ReturnType<typeof sensorsService.runSensors>> =
+			[];
+		if (!skipSensors) {
+			try {
+				sensorResults = await sensorsService.runSensors();
+			} catch {
+				// sensors optional
+			}
+		}
+
+		const rules = await validationRulesService.readRules();
+		const cycleStartAt = (cycle as Record<string, unknown>).start_at;
+		const since =
+			cycleStartAt instanceof Date
+				? cycleStartAt.toISOString()
+				: typeof cycleStartAt === "string"
+					? cycleStartAt
+					: undefined;
+		const gitDiff = cycleValidationService.getGitDiffSince(since);
+		const preflight = await cycleValidationService.runPreflight(
+			cycleTasks,
+			sensorResults,
+			[],
+			gitDiff,
+			rules,
+		);
+
+		const lines: string[] = [
+			`# Pre-flight Validation — ${cycleId}: ${cycle.name}\n`,
+		];
+		const overallIcon = preflight.passed ? "✅" : "❌";
+		lines.push(
+			`${overallIcon} **Overall**: ${preflight.passed ? "PASS" : `FAIL (${preflight.errors.length} error(s))`}`,
+		);
+		lines.push(`- Tasks: ${preflight.doneTasks}/${preflight.totalTasks} done`);
+		lines.push(`- Without evidence: ${preflight.tasksWithoutEvidence.length}`);
+		lines.push(`- Blocked: ${preflight.blockedTasks}`);
+
+		if (sensorResults.length > 0) {
+			const passed = sensorResults.filter((r) => r.passed).length;
+			lines.push(`- Sensors: ${passed}/${sensorResults.length} passed`);
+		}
+
+		if (preflight.driftViolations.length > 0) {
+			lines.push(`- Drift violations: ${preflight.driftViolations.length}`);
+			for (const v of preflight.driftViolations.slice(0, 5)) {
+				lines.push(`  ↳ ${v.file}:${v.line} — ${v.decisionTitle}`);
+			}
+		} else {
+			lines.push("- Architecture drift: none detected");
+		}
+
+		if (preflight.warnings.length > 0) {
+			lines.push(`\n**Warnings:**`);
+			for (const w of preflight.warnings) lines.push(`  ⚠ ${w}`);
+		}
+		if (preflight.errors.length > 0) {
+			lines.push(`\n**Errors:**`);
+			for (const e of preflight.errors) lines.push(`  ✖ ${e}`);
+		}
+
+		return { content: [{ type: "text", text: lines.join("\n") }] };
+	}
+
+	if (name === "run_feedback_sensors") {
+		const sensorNames = Array.isArray(args?.sensors)
+			? (args.sensors as string[])
+			: undefined;
+		const results = await sensorsService.runSensors(sensorNames);
+		if (results.length === 0) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: "No sensors configured. Add sensors with: vem sensors add <name> --cmd <command>",
+					},
+				],
+			};
+		}
+		const summary = sensorsService.formatResultsForAgent(results);
+		const allPassed = results.every((r) => r.passed);
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Sensor results (${allPassed ? "ALL PASSED" : "SOME FAILED"}):\n\n${summary}`,
+				},
+			],
+		};
+	}
+
+	if (name === "get_cycle_health") {
+		const cycleId = args?.cycle_id as string | undefined;
+		const cycle = cycleId
+			? await cycleService.getCycle(cycleId)
+			: await cycleService.getActiveCycle();
+
+		if (!cycle) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: cycleId
+							? `Cycle ${cycleId} not found.`
+							: "No active cycle found.",
+					},
+				],
+			};
+		}
+
+		const tasks = await taskService.getTasks();
+		const cycleTasks = tasks.filter(
+			(t) => t.cycle_id === cycle!.id && !t.deleted_at,
+		);
+		const byStatus = cycleTasks.reduce<Record<string, number>>((acc, t) => {
+			acc[t.status] = (acc[t.status] ?? 0) + 1;
+			return acc;
+		}, {});
+
+		const report = await cycleValidationService.loadReport(cycle.id);
+
+		const health = {
+			cycle: {
+				id: cycle.id,
+				name: cycle.name,
+				goal: cycle.goal,
+				appetite: cycle.appetite,
+				status: cycle.status,
+			},
+			tasks: { total: cycleTasks.length, byStatus },
+			lastValidation: report
+				? {
+						ranAt: report.ranAt,
+						overallStatus: report.overallStatus,
+						errors: report.preflight.errors,
+						warnings: report.preflight.warnings,
+					}
+				: null,
+		};
+
+		return {
+			content: [{ type: "text", text: JSON.stringify(health, null, 2) }],
+		};
+	}
+
+	if (name === "get_cycle_retrospective") {
+		const cycleId = args?.cycle_id as string;
+		if (!cycleId) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: "cycle_id is required." }],
+			};
+		}
+
+		const cycle = await cycleService.getCycle(cycleId);
+		if (!cycle) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: `Cycle ${cycleId} not found.` }],
+			};
+		}
+
+		const tasks = await taskService.getTasks();
+		const retro = cycleRetroService.build({
+			cycleId: cycle.id,
+			cycleName: cycle.name,
+			cycleGoal: cycle.goal,
+			appetite: cycle.appetite,
+			startedAt: cycle.start_at,
+			closedAt: cycle.closed_at,
+			tasks: tasks.map((t) => ({
+				id: t.id,
+				title: t.title,
+				status: t.status,
+				evidence: t.evidence,
+				cycle_id: t.cycle_id,
+				deleted_at: t.deleted_at,
+			})),
+			decisions: [],
+			totalValidationRuns: 0,
+			openIssues: 0,
+			resolvedIssues: 0,
+		});
+
+		return {
+			content: [{ type: "text", text: cycleRetroService.toMarkdown(retro) }],
+		};
+	}
+
+	if (name === "get_task_spec") {
+		const taskId = (args as Record<string, string>).task_id;
+		const task = await taskService.getTask(taskId);
+		if (!task) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: `Task ${taskId} not found.` }],
+			};
+		}
+		const criteria = task.acceptance_criteria ?? [];
+		if (criteria.length === 0) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `No acceptance criteria defined for task ${taskId}: ${task.title}.\n\nUse set_task_spec to define what "done" means.`,
+					},
+				],
+			};
+		}
+		const lines = criteria.map((c, i) => `${i + 1}. ${c}`).join("\n");
+		return {
+			content: [
+				{
+					type: "text",
+					text: `# Acceptance Criteria — ${taskId}: ${task.title}\n\n${lines}`,
+				},
+			],
+		};
+	}
+
+	if (name === "set_task_spec") {
+		const { task_id: taskId, criteria } = args as {
+			task_id: string;
+			criteria: string[];
+		};
+		const task = await taskService.getTask(taskId);
+		if (!task) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: `Task ${taskId} not found.` }],
+			};
+		}
+		await taskService.updateTask(taskId, {
+			acceptance_criteria: criteria,
+		} as Parameters<typeof taskService.updateTask>[1]);
+		return {
+			content: [
+				{
+					type: "text",
+					text: `✔ Set ${criteria.length} acceptance criteria for ${taskId}: ${task.title}.`,
+				},
+			],
+		};
+	}
+
+	if (name === "get_constitution") {
+		const constitutionContent = await constitutionService.get();
+		return {
+			content: [
+				{
+					type: "text",
+					text:
+						constitutionContent ??
+						"(No constitution defined. Run `vem constitution init` to create one.)",
+				},
+			],
+		};
+	}
+
+	if (name === "get_context_index") {
+		const vemDir = await getVemDir();
+		const parts: string[] = ["# Project Memory Index\n"];
+
+		// CONTEXT.md sections
+		try {
+			const contextRaw = await readFile(join(vemDir, "CONTEXT.md"), "utf-8");
+			const headings = contextRaw
+				.split("\n")
+				.filter((l) => l.startsWith("#"))
+				.slice(0, 10)
+				.map((l) => `  ${l}`);
+			parts.push(`## CONTEXT.md\n${headings.join("\n") || "  (no headings)"}`);
+		} catch {
+			parts.push("## CONTEXT.md\n  (not found)");
+		}
+
+		// CURRENT_STATE.md
+		try {
+			const csRaw = await readFile(join(vemDir, CURRENT_STATE_FILE), "utf-8");
+			const firstLine = csRaw.split("\n").find((l) => l.trim()) ?? "(empty)";
+			parts.push(`## CURRENT_STATE.md\n  ${firstLine}`);
+		} catch {
+			parts.push("## CURRENT_STATE.md\n  (not found)");
+		}
+
+		// Active tasks count
+		try {
+			const tasks = await taskService.getTasks();
+			const active = tasks.filter((t) => !t.deleted_at && t.status !== "done");
+			parts.push(
+				`## Tasks\n  ${active.length} active task(s) · use get_context_section(section: "tasks") for full list`,
+			);
+		} catch {
+			parts.push("## Tasks\n  (unavailable)");
+		}
+
+		// Decisions count
+		try {
+			const { readdir } = await import("node:fs/promises");
+			const decisionsDir = join(vemDir, DECISIONS_DIR);
+			const files = await readdir(decisionsDir).catch(() => [] as string[]);
+			const count = files.filter((f) => f.endsWith(".md")).length;
+			parts.push(
+				`## Decisions\n  ${count} ADR(s) · use get_context_section(section: "decisions") for full list`,
+			);
+		} catch {
+			parts.push("## Decisions\n  (unavailable)");
+		}
+
+		// Changelog entries count
+		try {
+			const { readdir } = await import("node:fs/promises");
+			const changelogDir = join(vemDir, CHANGELOG_DIR);
+			const files = await readdir(changelogDir).catch(() => [] as string[]);
+			const count = files.filter((f) => f.endsWith(".md")).length;
+			parts.push(
+				`## Changelog\n  ${count} entr(ies) · use get_context_section(section: "changelog") for recent entries`,
+			);
+		} catch {
+			parts.push("## Changelog\n  (unavailable)");
+		}
+
+		// Constitution
+		const hasConstitution = await constitutionService.exists();
+		parts.push(
+			`## Constitution\n  ${hasConstitution ? "Defined — use get_constitution() to load" : "Not defined — run `vem constitution init`"}`,
+		);
+
+		return {
+			content: [{ type: "text", text: parts.join("\n\n") }],
+		};
+	}
+
+	if (name === "get_context_section") {
+		const section = (args as Record<string, string>).section as string;
+		const vemDir = await getVemDir();
+
+		if (section === "context") {
+			const content = await readFile(join(vemDir, "CONTEXT.md"), "utf-8").catch(
+				() => "(CONTEXT.md not found)",
+			);
+			return { content: [{ type: "text", text: content }] };
+		}
+
+		if (section === "current_state") {
+			const content = await readFile(
+				join(vemDir, CURRENT_STATE_FILE),
+				"utf-8",
+			).catch(() => "(CURRENT_STATE.md not found)");
+			return { content: [{ type: "text", text: content }] };
+		}
+
+		if (section === "constitution") {
+			const content = await constitutionService.get();
+			return {
+				content: [
+					{ type: "text", text: content ?? "(No constitution defined)" },
+				],
+			};
+		}
+
+		if (section === "tasks") {
+			const tasks = await taskService.getTasks();
+			const active = tasks.filter((t) => !t.deleted_at && t.status !== "done");
+			if (active.length === 0) {
+				return { content: [{ type: "text", text: "No active tasks." }] };
+			}
+			const lines = active.map(
+				(t) =>
+					`- [${t.status}] ${t.id}: ${t.title}${t.blocked_reason ? ` ⚠ ${t.blocked_reason}` : ""}`,
+			);
+			return {
+				content: [
+					{ type: "text", text: `# Active Tasks\n\n${lines.join("\n")}` },
+				],
+			};
+		}
+
+		if (section === "decisions") {
+			const decisionsDir = join(vemDir, DECISIONS_DIR);
+			const { readdir } = await import("node:fs/promises");
+			const files = await readdir(decisionsDir).catch(() => [] as string[]);
+			const mdFiles = files
+				.filter((f) => f.endsWith(".md"))
+				.sort()
+				.slice(-10);
+			if (mdFiles.length === 0) {
+				return {
+					content: [{ type: "text", text: "No decisions recorded yet." }],
+				};
+			}
+			const contents = await Promise.all(
+				mdFiles.map(async (f) => {
+					const raw = await readFile(join(decisionsDir, f), "utf-8").catch(
+						() => "",
+					);
+					return `### ${f}\n${raw.trim()}`;
+				}),
+			);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `# Architectural Decisions\n\n${contents.join("\n\n---\n\n")}`,
+					},
+				],
+			};
+		}
+
+		if (section === "changelog") {
+			const changelogDir = join(vemDir, CHANGELOG_DIR);
+			const { readdir } = await import("node:fs/promises");
+			const files = await readdir(changelogDir).catch(() => [] as string[]);
+			const mdFiles = files
+				.filter((f) => f.endsWith(".md"))
+				.sort()
+				.slice(-5);
+			if (mdFiles.length === 0) {
+				return {
+					content: [{ type: "text", text: "No changelog entries yet." }],
+				};
+			}
+			const contents = await Promise.all(
+				mdFiles.map(async (f) => {
+					const raw = await readFile(join(changelogDir, f), "utf-8").catch(
+						() => "",
+					);
+					return `### ${f}\n${raw.trim()}`;
+				}),
+			);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `# Recent Changelog\n\n${contents.join("\n\n---\n\n")}`,
+					},
+				],
+			};
+		}
+
+		return {
+			isError: true,
+			content: [{ type: "text", text: `Unknown section: ${section}` }],
 		};
 	}
 
